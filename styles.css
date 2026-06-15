@@ -1,0 +1,12 @@
+/* ocr-image plugin styles */
+
+.ocr-image-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ocr-image-progress {
+  font-size: 0.85em;
+  opacity: 0.8;
+}

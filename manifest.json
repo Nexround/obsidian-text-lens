@@ -1,0 +1,10 @@
+{
+  "id": "ocr-image",
+  "name": "OCR Images",
+  "version": "1.0.0",
+  "minAppVersion": "1.7.2",
+  "description": "Run PaddleX OCR on images in the current note and insert recognized text inline.",
+  "author": "wangrunyu",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}
