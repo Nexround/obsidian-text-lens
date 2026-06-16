@@ -514,7 +514,7 @@ class OcrImageSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Test connection")
       .setDesc(
-        "Send a 1×1 white PNG to the OCR server to verify the API URL and connectivity."
+        "Call GET /health on the OCR server to verify connectivity."
       )
       .addButton((btn) =>
         btn
@@ -523,13 +523,26 @@ class OcrImageSettingTab extends PluginSettingTab {
           .onClick(async () => {
             btn.setButtonText("Testing…").setDisabled(true);
             try {
-              // Minimal 1×1 white PNG (valid PNG, ~70 bytes)
-              const testB64 =
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAABjE+ibYAAAAASUVORK5CYII=";
-              await callOcrApi(this.plugin.settings, testB64, false);
-              new Notice("✅ OCR connection test: SUCCESS", 3000);
+              // Derive health-check URL from the configured OCR endpoint
+              const healthUrl = new URL(this.plugin.settings.apiUrl);
+              healthUrl.pathname = "/health";
+
+              const resp = await requestUrl({
+                url: healthUrl.toString(),
+                method: "GET",
+                throw: false,
+              });
+
+              const data = resp.json as { errorCode?: number; errorMsg?: string };
+              if (resp.status === 200 && data.errorCode === 0) {
+                new Notice("✅ Server healthy", 3000);
+              } else {
+                throw new Error(
+                  `HTTP ${resp.status} — errorCode=${data.errorCode ?? "?"}, ${data.errorMsg ?? "unknown"}`
+                );
+              }
             } catch (err) {
-              new Notice(`❌ OCR connection test FAILED: ${(err as Error).message}`, 6000);
+              new Notice(`❌ Health check failed: ${(err as Error).message}`, 6000);
             } finally {
               btn.setButtonText("Test").setDisabled(false);
             }
