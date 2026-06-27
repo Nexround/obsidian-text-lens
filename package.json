@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",
-    "deploy": "node esbuild.config.mjs production && cp main.js manifest.json styles.css \"/Users/wangrunyu/Documents/Obsidian Vault/.obsidian/plugins/ocr-image/\""
+    "build:bundle": "node scripts/build-bundle.mjs",
+    "deploy": "node esbuild.config.mjs production && node scripts/deploy.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -14,5 +15,9 @@
     "esbuild": "^0.21.0",
     "obsidian": "^1.7.2",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.27.0",
+    "ppu-paddle-ocr": "^6.0.0"
   }
 }
