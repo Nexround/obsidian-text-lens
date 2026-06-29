@@ -92,7 +92,7 @@ This is recognized text
 | **Output format** | Callout | `> [!note]+` callout or ` ```ocr ` fenced block |
 | **Skip already-processed** | On | Don't re-OCR images that already have a block below them |
 | **Merge wrapped lines** | On | Join soft-wrapped OCR lines into natural prose; preserves paragraph gaps and list items |
-| **Max concurrency** | 3 | How many images to OCR in parallel (1–10) |
+| **Max concurrency** | 3 | How many images to OCR in parallel (1–20) |
 
 ### Diagnostics
 
