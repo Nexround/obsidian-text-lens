@@ -17,6 +17,8 @@ interface OcrImageSettings {
   // Output
   outputFormat: "callout" | "codeblock";
   skipAlreadyProcessed: boolean;
+  // Concurrency
+  maxConcurrency: number;
   // Post-processing
   useTextRefinement: boolean;
   // OCR enhancement toggles (remote only)
@@ -36,6 +38,7 @@ const DEFAULT_SETTINGS: OcrImageSettings = {
   apiUrl: "http://runyu.wang:6181/ocr",
   outputFormat: "callout",
   skipAlreadyProcessed: true,
+  maxConcurrency: 3,
   useTextRefinement: true,
   useDocOrientationClassify: false,
   useDocUnwarping: false,
@@ -440,7 +443,51 @@ function isAlreadyProcessed(content: string, insertPos: number): boolean {
   );
 }
 
+function removeOcrBlock(content: string, insertPos: number): string {
+  const tail = content.slice(insertPos);
+
+  const callout = tail.match(/^\n>[^\n]*(?:\n>[^\n]*)*\n/);
+  if (callout) {
+    return content.slice(0, insertPos) + tail.slice(callout[0].length);
+  }
+
+  const codeblock = tail.match(/^\n```ocr\n[\s\S]*?\n```\n/);
+  if (codeblock) {
+    return content.slice(0, insertPos) + tail.slice(codeblock[0].length);
+  }
+
+  return content;
+}
+
+// ── Concurrency helper ────────────────────────────────────────────────────────
+
+async function withConcurrency<T>(
+  thunks: Array<() => Promise<T>>,
+  limit: number
+): Promise<T[]> {
+  const results: T[] = new Array(thunks.length);
+  let next = 0;
+
+  async function worker(): Promise<void> {
+    while (next < thunks.length) {
+      const i = next++;
+      results[i] = await thunks[i]();
+    }
+  }
+
+  const slots = Math.min(Math.max(limit, 1), thunks.length);
+  await Promise.all(Array.from({ length: slots }, worker));
+  return results;
+}
+
 // ── Main processing ───────────────────────────────────────────────────────────
+
+interface OcrTaskResult {
+  img: ImageMatch;
+  texts: string[] | null;
+  skipped: boolean;
+  error: Error | null;
+}
 
 async function processNote(
   app: App,
@@ -456,57 +503,75 @@ async function processNote(
     return;
   }
 
-  const notice = new Notice(`OCR: 0 / ${images.length} images…`, 0);
+  // If any image already has an OCR block, treat the whole run as a re-run:
+  // force-OCR every image and replace existing blocks.
+  const isRerun = images.some(
+    (img) => isAlreadyProcessed(content, img.index + img.fullMatch.length)
+  );
+
+  const label = isRerun ? "Re-OCR" : "OCR";
+  const notice = new Notice(`${label}: 0 / ${images.length} done…`, 0);
   let done = 0;
-  let errors = 0;
 
-  // Process in reverse document order so that earlier offsets remain valid
-  // after each insertion at a later position.
-  const reversed = [...images].reverse();
-  let workingContent = content;
-
-  for (const img of reversed) {
+  // ── Phase 1: concurrent OCR calls ────────────────────────────────────────────
+  const thunks = images.map((img): (() => Promise<OcrTaskResult>) => async () => {
     const insertPos = img.index + img.fullMatch.length;
-    notice.setMessage(`OCR: ${done + 1} / ${images.length} — ${img.src.split("/").pop()}`);
+
+    if (!isRerun && plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(content, insertPos)) {
+      notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
+      return { img, texts: null, skipped: true, error: null };
+    }
 
     try {
-      // Skip images that already have an OCR block below them
-      if (plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(workingContent, insertPos)) {
-        done++;
-        continue;
-      }
-
       const fileOrUrl = img.isUrl
         ? img.src
         : await fileToBase64(app, img.src, activeFile);
 
       const rawTexts = await callOcrApi(plugin.settings, fileOrUrl, img.isUrl);
+      if (rawTexts.length === 0) throw new Error("OCR returned no text");
+
       const texts = plugin.settings.useTextRefinement
         ? refineLineBreaks(rawTexts)
         : rawTexts;
 
-      if (texts.length > 0) {
-        const insertion = formatOcrText(texts, plugin.settings.outputFormat, img.src);
-        workingContent =
-          workingContent.slice(0, insertPos) + insertion + workingContent.slice(insertPos);
-      }
-
-      done++;
+      notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
+      return { img, texts, skipped: false, error: null };
     } catch (err) {
       console.error(`[ocr-image] Failed for "${img.src}":`, err);
-      errors++;
-      done++;
+      notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
+      return {
+        img,
+        texts: null,
+        skipped: false,
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
     }
+  });
+
+  const results = await withConcurrency(thunks, plugin.settings.maxConcurrency);
+
+  // ── Phase 2: serial insertion in reverse document order ───────────────────────
+  let workingContent = content;
+  for (const { img, texts } of [...results].sort((a, b) => b.img.index - a.img.index)) {
+    if (!texts) continue;
+    const insertPos = img.index + img.fullMatch.length;
+    if (isRerun) workingContent = removeOcrBlock(workingContent, insertPos);
+    const insertion = formatOcrText(texts, plugin.settings.outputFormat, img.src);
+    workingContent =
+      workingContent.slice(0, insertPos) + insertion + workingContent.slice(insertPos);
   }
 
-  // Apply all changes in one operation → single undo history entry
   editor.setValue(workingContent);
 
   notice.hide();
+  const errors = results.filter((r) => r.error).length;
   if (errors > 0) {
-    new Notice(`OCR complete: ${done - errors} succeeded, ${errors} failed. Check console for details.`, 6000);
+    new Notice(
+      `OCR complete: ${results.length - errors} succeeded, ${errors} failed. Check console for details.`,
+      6000
+    );
   } else {
-    new Notice(`OCR complete: ${done} image(s) processed.`, 4000);
+    new Notice(`OCR complete: ${results.length} image(s) processed.`, 4000);
   }
 }
 
@@ -577,6 +642,20 @@ class OcrImageSettingTab extends PluginSettingTab {
           this.plugin.settings.useTextRefinement = value;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Max concurrency")
+      .setDesc("How many OCR requests to run in parallel (1–10).")
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 10, 1)
+          .setValue(this.plugin.settings.maxConcurrency)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.maxConcurrency = value;
+            await this.plugin.saveSettings();
+          })
       );
 
     // ── Enhancement options ───────────────────────────────────────────────────
