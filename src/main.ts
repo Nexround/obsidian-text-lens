@@ -463,7 +463,7 @@ class OcrImageSettingTab extends PluginSettingTab {
         `/.obsidian/plugins/${this.plugin.manifest.id}`;
       const installed = isRuntimeInstalled(pluginDir);
 
-      const statusEl = containerEl.createEl("p", {
+      containerEl.createEl("p", {
         cls: "setting-item-description",
         text: installed
           ? this.plugin.localEngine.ready
@@ -488,12 +488,11 @@ class OcrImageSettingTab extends PluginSettingTab {
                   });
                   // Prime the module path so subsequent require() finds it
                   prependPluginModulePath(pluginDir);
-                  statusEl.setText("✅ Runtime installed. Reload Obsidian to activate.");
-                  new Notice("Local OCR runtime installed! Please reload Obsidian.", 8000);
+                  new Notice("Local OCR runtime installed!", 8000);
+                  this.display(); // re-render panel to show installed state
                 } catch (err) {
                   new Notice(`Setup failed: ${(err as Error).message}`, 8000);
                   console.error("[text-lens] Runtime setup failed:", err);
-                } finally {
                   btn.setButtonText("Setup").setDisabled(false);
                 }
               })
