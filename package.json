@@ -1,6 +1,6 @@
 {
   "name": "text-lens",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Obsidian plugin: TextLens — OCR images via PaddleOCR/PaddleX",
   "main": "main.js",
   "scripts": {
