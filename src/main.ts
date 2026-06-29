@@ -669,14 +669,15 @@ class OcrImageSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Max concurrency")
-      .setDesc("How many OCR requests to run in parallel.")
-      .addSlider((slider) =>
-        slider
-          .setLimits(1, 10, 1)
-          .setValue(this.plugin.settings.maxConcurrency)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            this.plugin.settings.maxConcurrency = value;
+      .setDesc("How many OCR requests to run in parallel (1–20).")
+      .addText((text) =>
+        text
+          .setPlaceholder("3")
+          .setValue(String(this.plugin.settings.maxConcurrency))
+          .onChange(async (raw) => {
+            const n = parseInt(raw, 10);
+            if (!Number.isFinite(n)) return;
+            this.plugin.settings.maxConcurrency = Math.min(20, Math.max(1, n));
             await this.plugin.saveSettings();
           })
       );
