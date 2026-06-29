@@ -3,17 +3,19 @@ import {
   Editor,
   FileSystemAdapter,
   MarkdownView,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
   Setting,
   TFile,
-  requestUrl,
 } from "obsidian";
 
 import {
   isRuntimeInstalled,
   installRuntime,
+  uninstallRuntime,
+  clearModelCache,
   prependPluginModulePath,
   type DownloadProgress,
 } from "./native-manager";
@@ -21,29 +23,12 @@ import { LocalOcrEngine, type ModelTier } from "./local-ocr";
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
-type OcrMode = "remote" | "local" | "auto";
-
 interface OcrImageSettings {
-  // Mode
-  ocrMode: OcrMode;
-  // Remote OCR settings
-  apiUrl: string;
   // Local OCR settings
   localModelTier: ModelTier;
   // Output
   outputFormat: "callout" | "codeblock";
   skipAlreadyProcessed: boolean;
-  // OCR enhancement toggles (remote only)
-  useDocOrientationClassify: boolean;
-  useDocUnwarping: boolean;
-  useTextlineOrientation: boolean;
-  // Detection thresholds — null means omit from request (server default)
-  textDetLimitSideLen: number | null;
-  textDetLimitType: "min" | "max" | null;
-  textDetThresh: number | null;
-  textDetBoxThresh: number | null;
-  textDetUnclipRatio: number | null;
-  textRecScoreThresh: number | null;
   // Concurrency
   maxConcurrency: number;
   // Post-processing
@@ -53,58 +38,13 @@ interface OcrImageSettings {
 }
 
 const DEFAULT_SETTINGS: OcrImageSettings = {
-  ocrMode: "auto",
-  apiUrl: "http://runyu.wang:6181/ocr",
   localModelTier: "small",
   outputFormat: "callout",
   skipAlreadyProcessed: true,
-  useDocOrientationClassify: false,
-  useDocUnwarping: false,
-  useTextlineOrientation: false,
-  textDetLimitSideLen: null,
-  textDetLimitType: null,
-  textDetThresh: null,
-  textDetBoxThresh: null,
-  textDetUnclipRatio: null,
-  textRecScoreThresh: null,
   maxConcurrency: 3,
   useTextRefinement: true,
   devMode: false,
 };
-
-// ── API types ─────────────────────────────────────────────────────────────────
-
-interface OcrApiRequest {
-  file: string;
-  fileType?: number;
-  useDocOrientationClassify?: boolean;
-  useDocUnwarping?: boolean;
-  useTextlineOrientation?: boolean;
-  textDetLimitSideLen?: number;
-  textDetLimitType?: string;
-  textDetThresh?: number;
-  textDetBoxThresh?: number;
-  textDetUnclipRatio?: number;
-  textRecScoreThresh?: number;
-}
-
-interface OcrApiResponse {
-  logId: string;
-  errorCode: number;
-  errorMsg: string;
-  result?: {
-    ocrResults: Array<{
-      prunedResult: {
-        texts: string[];       // always empty in current server version
-        rec_texts: string[];   // actual recognized text lines
-        rec_scores?: number[];
-        rec_boxes?: number[][];
-      };
-      ocrImage: string | null;
-    }>;
-    dataInfo: object;
-  };
-}
 
 // ── Image match ───────────────────────────────────────────────────────────────
 
@@ -221,99 +161,6 @@ async function fileToArrayBuffer(app: App, imageSrc: string, activeFile: TFile):
   }
   return resp.arrayBuffer();
 }
-
-async function fileToBase64(app: App, imageSrc: string, activeFile: TFile): Promise<string> {
-  const buf = await fileToArrayBuffer(app, imageSrc, activeFile);
-  return arrayBufferToBase64(buf);
-}
-
-// ── Spatial layout ────────────────────────────────────────────────────────────
-
-const ROW_OVERLAP_RATIO = 0.6;
-/** Gap between rows exceeding this multiple of average row height → paragraph break */
-const PARAGRAPH_GAP_RATIO = 1.8;
-
-/** Internal row representation used for layout and paragraph analysis */
-interface RowGroup {
-  text: string;
-  minY: number;
-  maxY: number;
-}
-
-/**
- * Core layout analysis: cluster individual OCR boxes into visual rows sorted in
- * reading order (top-to-bottom, left-to-right within each row).
- */
-function buildRowGroups(texts: string[], boxes: number[][]): RowGroup[] {
-  const items = texts.map((text, i) => {
-    const [x1, y1, x2, y2] = boxes[i];
-    return { text, cx: (x1 + x2) / 2, cy: (y1 + y2) / 2, h: y2 - y1 };
-  });
-
-  items.sort((a, b) => a.cy - b.cy);
-
-  const rawRows: (typeof items)[] = [];
-  for (const item of items) {
-    const row = rawRows.find((r) => {
-      const rowCy = r.reduce((s, x) => s + x.cy, 0) / r.length;
-      const rowH  = Math.max(...r.map((x) => x.h));
-      return Math.abs(item.cy - rowCy) < Math.max(item.h, rowH) * ROW_OVERLAP_RATIO;
-    });
-    if (row) row.push(item);
-    else rawRows.push([item]);
-  }
-
-  // Sort rows top-to-bottom, then build RowGroup records
-  rawRows.sort((a, b) => {
-    const aCy = a.reduce((s, x) => s + x.cy, 0) / a.length;
-    const bCy = b.reduce((s, x) => s + x.cy, 0) / b.length;
-    return aCy - bCy;
-  });
-
-  return rawRows.map((row) => {
-    const sorted = [...row].sort((a, b) => a.cx - b.cx);
-    return {
-      text: sorted.map((x) => x.text).join("  "),
-      minY: Math.min(...row.map((x) => x.cy - x.h / 2)),
-      maxY: Math.max(...row.map((x) => x.cy + x.h / 2)),
-    };
-  });
-}
-
-/**
- * Group OCR text boxes into reading-order rows using bounding-box coordinates.
- */
-function groupTextByRows(texts: string[], boxes: number[][]): string[] {
-  if (texts.length === 0) return [];
-  if (texts.length !== boxes.length) return texts;
-  return buildRowGroups(texts, boxes).map((r) => r.text);
-}
-
-/**
- * Like groupTextByRows, but also inserts "" (empty string) between rows whose
- * vertical gap indicates a paragraph break. The empty strings act as hard-break
- * markers consumed by refineLineBreaks().
- */
-function groupTextByRowsWithParagraphs(texts: string[], boxes: number[][]): string[] {
-  if (texts.length === 0) return [];
-  if (texts.length !== boxes.length) return texts;
-
-  const rows = buildRowGroups(texts, boxes);
-  if (rows.length === 0) return texts;
-
-  const avgH = rows.reduce((s, r) => s + (r.maxY - r.minY), 0) / rows.length;
-
-  const result: string[] = [];
-  for (let i = 0; i < rows.length; i++) {
-    result.push(rows[i].text);
-    if (i < rows.length - 1) {
-      const gap = rows[i + 1].minY - rows[i].maxY;
-      if (gap > avgH * PARAGRAPH_GAP_RATIO) result.push(""); // paragraph marker
-    }
-  }
-  return result;
-}
-
 // ── Line-break refinement ─────────────────────────────────────────────────────
 
 /** Sentence-ending punctuation (Chinese + English) */
@@ -325,10 +172,6 @@ const LIST_START_RE = /^(?:\d+[.、。）)]\s|[①②③④⑤⑥⑦⑧⑨⑩]\s
 
 /**
  * Merge OCR text lines that are visual soft-wraps into natural prose lines.
- *
- * Empty strings in `texts` are treated as hard paragraph boundaries inserted by
- * groupTextByRowsWithParagraphs() and are preserved so that the final join("\n")
- * produces blank-line paragraph separation in the output.
  *
  * Merge decision (for two adjacent non-empty lines A → B):
  *  - A ends with sentence-terminating punctuation → hard break, keep.
@@ -381,103 +224,20 @@ function refineLineBreaks(texts: string[]): string[] {
   return out;
 }
 
-// ── Remote OCR API call ───────────────────────────────────────────────────────
+// ── OCR dispatch ─────────────────────────────────────────────────────────────
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`OCR request timed out after ${ms / 1000}s`)), ms)
-    ),
-  ]);
-}
-
-async function callOcrApi(
-  settings: OcrImageSettings,
-  fileOrUrl: string,
-  isUrl: boolean
-): Promise<string[]> {
-  const body: OcrApiRequest = { file: fileOrUrl };
-
-  if (!isUrl) body.fileType = 1;
-  if (settings.useDocOrientationClassify) body.useDocOrientationClassify = true;
-  if (settings.useDocUnwarping) body.useDocUnwarping = true;
-  if (settings.useTextlineOrientation) body.useTextlineOrientation = true;
-  if (settings.textDetLimitSideLen !== null) body.textDetLimitSideLen = settings.textDetLimitSideLen;
-  if (settings.textDetLimitType !== null) body.textDetLimitType = settings.textDetLimitType;
-  if (settings.textDetThresh !== null) body.textDetThresh = settings.textDetThresh;
-  if (settings.textDetBoxThresh !== null) body.textDetBoxThresh = settings.textDetBoxThresh;
-  if (settings.textDetUnclipRatio !== null) body.textDetUnclipRatio = settings.textDetUnclipRatio;
-  if (settings.textRecScoreThresh !== null) body.textRecScoreThresh = settings.textRecScoreThresh;
-
-  const fetchPromise = requestUrl({
-    url: settings.apiUrl,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    throw: false,
-  }).then((resp) => {
-    const data: OcrApiResponse = resp.json;
-    if (data.errorCode !== 0) {
-      throw new Error(`OCR API error ${data.errorCode}: ${data.errorMsg}`);
-    }
-    const ocrResult = data.result?.ocrResults?.[0];
-    if (!ocrResult) return [];
-    const texts = ocrResult.prunedResult.rec_texts ?? [];
-    const boxes = ocrResult.prunedResult.rec_boxes ?? [];
-    return groupTextByRowsWithParagraphs(texts, boxes);
-  });
-
-  return withTimeout(fetchPromise, 60_000);
-}
-
-// ── OCR dispatch (remote / local / auto) ─────────────────────────────────────
-
-/**
- * Run OCR on a single image using the configured mode.
- *
- * - "remote": always call remote API (imageBuffer only used for base64 conversion)
- * - "local":  always use LocalOcrEngine
- * - "auto":   try local first; fall back to remote on failure
- */
+/** Run OCR on a single vault image using the local engine. */
 async function runOcr(
   plugin: OcrImagePlugin,
   app: App,
   img: ImageMatch,
   activeFile: TFile
 ): Promise<string[]> {
-  const { settings } = plugin;
-
-  const useLocal = settings.ocrMode === "local" ||
-    (settings.ocrMode === "auto" && plugin.localEngine.ready);
-
-  const useRemote = settings.ocrMode === "remote" ||
-    (settings.ocrMode === "auto" && !plugin.localEngine.ready);
-
-  // ── Local path ───────────────────────────────────────────────────────────
-  if (useLocal && !img.isUrl) {
-    const buf = await fileToArrayBuffer(app, img.src, activeFile);
-    try {
-      const texts = await plugin.localEngine.recognize(buf);
-      if (texts.length > 0) return texts;
-      if (settings.ocrMode === "local") throw new Error("Local OCR returned no text");
-      // auto: fall through to remote
-    } catch (err) {
-      if (settings.ocrMode === "local") throw err;
-      // auto: log and fall through
-      console.error("[ocr-image] Local OCR failed, falling back to remote:", err);
-    }
+  if (img.isUrl) {
+    throw new Error("URL images are not supported in local-only mode");
   }
-
-  // ── Remote path ──────────────────────────────────────────────────────────
-  if (useRemote || (settings.ocrMode === "auto")) {
-    const fileOrUrl = img.isUrl
-      ? img.src
-      : await fileToBase64(app, img.src, activeFile);
-    return callOcrApi(settings, fileOrUrl, img.isUrl);
-  }
-
-  return [];
+  const buf = await fileToArrayBuffer(app, img.src, activeFile);
+  return plugin.localEngine.recognize(buf);
 }
 
 // ── Output formatting ─────────────────────────────────────────────────────────
@@ -568,7 +328,7 @@ async function processNote(
   const images = extractImages(content);
 
   if (images.length === 0) {
-    new Notice("OCR Images: no images found in current note.");
+    new Notice("TextLens: no images found in current note.");
     return;
   }
 
@@ -592,7 +352,7 @@ async function processNote(
       const rawTexts = await runOcr(plugin, app, img, activeFile);
 
       if (plugin.settings.devMode) {
-        console.log(`[ocr-image] ${img.src.split("/").pop()} raw:`, rawTexts);
+        console.log(`[text-lens] ${img.src.split("/").pop()} raw:`, rawTexts);
       }
 
       if (rawTexts.length === 0) throw new Error("OCR returned no text");
@@ -602,13 +362,13 @@ async function processNote(
         : rawTexts;
 
       if (plugin.settings.devMode && plugin.settings.useTextRefinement) {
-        console.log(`[ocr-image] ${img.src.split("/").pop()} refined:`, texts);
+        console.log(`[text-lens] ${img.src.split("/").pop()} refined:`, texts);
       }
 
       notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
       return { img, texts, skipped: false, error: null };
     } catch (err) {
-      console.error(`[ocr-image] Failed for "${img.src}":`, err);
+      console.error(`[text-lens] Failed for "${img.src}":`, err);
       notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
       return {
         img,
@@ -645,6 +405,41 @@ async function processNote(
   }
 }
 
+// ── Confirmation modal ────────────────────────────────────────────────────────
+
+/** Generic two-button confirmation dialog used for destructive operations. */
+class ConfirmModal extends Modal {
+  constructor(
+    app: App,
+    private title: string,
+    private body: string,
+    private confirmLabel: string,
+    private onConfirm: () => void,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    this.contentEl.createEl("h3", { text: this.title });
+    this.contentEl.createEl("p", { text: this.body });
+    new Setting(this.contentEl)
+      .addButton((btn) => btn.setButtonText("取消").onClick(() => this.close()))
+      .addButton((btn) =>
+        btn
+          .setButtonText(this.confirmLabel)
+          .setWarning()
+          .onClick(() => {
+            this.close();
+            this.onConfirm();
+          })
+      );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 // ── Settings tab ──────────────────────────────────────────────────────────────
 
 class OcrImageSettingTab extends PluginSettingTab {
@@ -659,34 +454,10 @@ class OcrImageSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "OCR Images" });
-
-    // ── OCR Mode ──────────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "OCR Engine" });
-
-    new Setting(containerEl)
-      .setName("OCR mode")
-      .setDesc(
-        "remote — always call the remote server. " +
-        "local — run PaddleOCR locally (requires runtime setup). " +
-        "auto — try local first, fall back to remote."
-      )
-      .addDropdown((drop) =>
-        drop
-          .addOption("auto",   "Auto (local → remote fallback)")
-          .addOption("local",  "Local only")
-          .addOption("remote", "Remote only")
-          .setValue(this.plugin.settings.ocrMode)
-          .onChange(async (value) => {
-            this.plugin.settings.ocrMode = value as OcrMode;
-            await this.plugin.saveSettings();
-            this.display(); // re-render to show/hide sections
-          })
-      );
+    containerEl.createEl("h2", { text: "TextLens" });
 
     // ── Local engine setup ────────────────────────────────────────────────────
-    if (this.plugin.settings.ocrMode !== "remote") {
-      containerEl.createEl("h3", { text: "Local OCR Engine" });
+    containerEl.createEl("h3", { text: "Local OCR Engine" });
 
       const pluginDir = (this.plugin.app.vault.adapter as FileSystemAdapter).basePath +
         `/.obsidian/plugins/${this.plugin.manifest.id}`;
@@ -721,7 +492,7 @@ class OcrImageSettingTab extends PluginSettingTab {
                   new Notice("Local OCR runtime installed! Please reload Obsidian.", 8000);
                 } catch (err) {
                   new Notice(`Setup failed: ${(err as Error).message}`, 8000);
-                  console.error("[ocr-image] Runtime setup failed:", err);
+                  console.error("[text-lens] Runtime setup failed:", err);
                 } finally {
                   btn.setButtonText("Setup").setDisabled(false);
                 }
@@ -748,7 +519,7 @@ class OcrImageSettingTab extends PluginSettingTab {
               try {
                 await this.plugin.resetLocalEngine();
               } catch (err) {
-                console.error("[ocr-image] Failed to reset local engine after model tier change:", err);
+                console.error("[text-lens] Failed to reset local engine after model tier change:", err);
                 new Notice(`切换模型失败: ${(err as Error).message}`, 6000);
               }
             })
@@ -764,7 +535,7 @@ class OcrImageSettingTab extends PluginSettingTab {
                 await this.plugin.resetLocalEngine();
                 new Notice("Local OCR engine unloaded.", 3000);
               } catch (err) {
-                console.error("[ocr-image] Failed to unload local engine:", err);
+                console.error("[text-lens] Failed to unload local engine:", err);
                 new Notice(`卸载引擎失败: ${(err as Error).message}`, 6000);
               }
               this.display();
@@ -783,73 +554,77 @@ class OcrImageSettingTab extends PluginSettingTab {
                   await this.plugin.localEngine.initialize();
                   this.display();
                 } catch (err) {
-                  console.error("[ocr-image] Failed to load local engine:", err);
+                  console.error("[text-lens] Failed to load local engine:", err);
                   new Notice(`加载引擎失败: ${(err as Error).message}`, 6000);
                   btn.setButtonText("Load").setDisabled(false);
                 }
               })
           );
       }
-    }
 
-    // ── Remote settings ───────────────────────────────────────────────────────
-    if (this.plugin.settings.ocrMode !== "local") {
-      containerEl.createEl("h3", { text: "Remote OCR Server" });
-
-      containerEl.createEl("p", {
-        cls: "setting-item-description",
-        text: "⚠️ Images are sent to the configured URL. Only use servers you control or trust.",
-      });
-
-      new Setting(containerEl)
-        .setName("API URL")
-        .setDesc("Full URL of the PaddleX OCR endpoint (POST /ocr).")
-        .addText((text) =>
-          text
-            .setPlaceholder("http://runyu.wang:6181/ocr")
-            .setValue(this.plugin.settings.apiUrl)
-            .onChange(async (value) => {
-              this.plugin.settings.apiUrl = value.trim();
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(containerEl)
-        .setName("Test connection")
-        .setDesc("Call GET /health on the OCR server to verify connectivity.")
-        .addButton((btn) =>
-          btn
-            .setButtonText("Test")
-            .setCta()
-            .onClick(async () => {
-              btn.setButtonText("Testing…").setDisabled(true);
-              try {
-                const healthUrl = new URL(this.plugin.settings.apiUrl);
-                healthUrl.pathname = "/health";
-
-                const resp = await requestUrl({
-                  url: healthUrl.toString(),
-                  method: "GET",
-                  throw: false,
-                });
-
-                const data = resp.json as { errorCode?: number; errorMsg?: string };
-                if (resp.status === 200 && data.errorCode === 0) {
-                  new Notice("✅ Server healthy", 3000);
-                } else {
-                  throw new Error(
-                    `HTTP ${resp.status} — errorCode=${data.errorCode ?? "?"}, ${data.errorMsg ?? "unknown"}`
-                  );
+      // ── Cleanup ──────────────────────────────────────────────────────────────
+      if (installed) {
+        new Setting(containerEl)
+          .setName("Delete runtime files")
+          .setDesc(
+            "Remove onnxruntime-node, @napi-rs/canvas and ppu-bundle from the plugin directory (~40 MB). " +
+            "The engine will be unloaded first. You can re-install via \"Setup\"."
+          )
+          .addButton((btn) =>
+            btn.setButtonText("Delete").setWarning().onClick(() => {
+              new ConfirmModal(
+                this.plugin.app,
+                "Delete runtime files?",
+                "This will remove ~40 MB of native binaries from the plugin directory. " +
+                  "The local engine will be unloaded. You can re-install them at any time via \"Setup\".",
+                "Delete",
+                async () => {
+                  try {
+                    await this.plugin.localEngine?.destroy();
+                    await uninstallRuntime(pluginDir);
+                    new Notice("Runtime files deleted.", 4000);
+                  } catch (err) {
+                    new Notice(`删除失败: ${(err as Error).message}`, 6000);
+                    console.error("[text-lens] Failed to uninstall runtime:", err);
+                  }
+                  this.display();
                 }
-              } catch (err) {
-                console.error("[ocr-image] Health check failed:", err);
-                new Notice(`❌ Health check failed: ${(err as Error).message}`, 6000);
-              } finally {
-                btn.setButtonText("Test").setDisabled(false);
-              }
+              ).open();
             })
+          );
+      }
+
+      new Setting(containerEl)
+        .setName("Clear model cache")
+        .setDesc(
+          "Delete downloaded model weights from ~/.cache/ppu-paddle-ocr/ (5–60 MB depending on tier). " +
+          "Models will be re-downloaded automatically on next OCR run."
+        )
+        .addButton((btn) =>
+          btn.setButtonText("Clear").setWarning().onClick(() => {
+            new ConfirmModal(
+              this.plugin.app,
+              "Clear model cache?",
+              "This will delete cached model weights from ~/.cache/ppu-paddle-ocr/. " +
+                "They will be re-downloaded automatically when you next run OCR.",
+              "Clear",
+              async () => {
+                try {
+                  const { deleted, cachePath } = await clearModelCache();
+                  new Notice(
+                    deleted
+                      ? `Model cache cleared: ${cachePath}`
+                      : "No model cache found.",
+                    4000
+                  );
+                } catch (err) {
+                  new Notice(`清除失败: ${(err as Error).message}`, 6000);
+                  console.error("[text-lens] Failed to clear model cache:", err);
+                }
+              }
+            ).open();
+          })
         );
-    }
 
     // ── Output ────────────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Output" });
@@ -884,8 +659,7 @@ class OcrImageSettingTab extends PluginSettingTab {
         "Automatically join OCR lines that are visual soft-wraps " +
         "(e.g. a paragraph split across image rows). " +
         "Lines ending with sentence punctuation (。！？ etc.) and list items " +
-        "are always kept separate. Paragraph gaps are detected from bounding-box " +
-        "spacing (remote mode) or punctuation alone (local mode)."
+        "are always kept separate."
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.useTextRefinement).onChange(async (value) => {
@@ -907,98 +681,6 @@ class OcrImageSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
-
-    // ── Enhancement options (remote only) ────────────────────────────────────
-    if (this.plugin.settings.ocrMode !== "local") {
-      containerEl.createEl("h3", { text: "Remote Enhancement Options" });
-
-      new Setting(containerEl)
-        .setName("Document orientation classify")
-        .setDesc("Auto-detect and correct document rotation.")
-        .addToggle((toggle) =>
-          toggle
-            .setValue(this.plugin.settings.useDocOrientationClassify)
-            .onChange(async (value) => {
-              this.plugin.settings.useDocOrientationClassify = value;
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(containerEl)
-        .setName("Document unwarping")
-        .setDesc("Correct perspective distortion for scanned documents.")
-        .addToggle((toggle) =>
-          toggle.setValue(this.plugin.settings.useDocUnwarping).onChange(async (value) => {
-            this.plugin.settings.useDocUnwarping = value;
-            await this.plugin.saveSettings();
-          })
-        );
-
-      new Setting(containerEl)
-        .setName("Text line orientation")
-        .setDesc("Classify orientation of individual text lines.")
-        .addToggle((toggle) =>
-          toggle
-            .setValue(this.plugin.settings.useTextlineOrientation)
-            .onChange(async (value) => {
-              this.plugin.settings.useTextlineOrientation = value;
-              await this.plugin.saveSettings();
-            })
-        );
-
-      containerEl.createEl("h3", { text: "Detection Thresholds" });
-      containerEl.createEl("p", {
-        text: "Leave blank to use server defaults.",
-        cls: "setting-item-description",
-      });
-
-      const numericSetting = (
-        name: string,
-        desc: string,
-        key: keyof OcrImageSettings,
-        placeholder: string
-      ) => {
-        new Setting(containerEl)
-          .setName(name)
-          .setDesc(desc)
-          .addText((text) =>
-            text
-              .setPlaceholder(placeholder)
-              .setValue(
-                this.plugin.settings[key] !== null ? String(this.plugin.settings[key]) : ""
-              )
-              .onChange(async (raw) => {
-                const trimmed = raw.trim();
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                (this.plugin.settings as any)[key] =
-                  trimmed === "" ? null : parseFloat(trimmed);
-                await this.plugin.saveSettings();
-              })
-          );
-      };
-
-      numericSetting("Pixel detection threshold", "textDetThresh (e.g. 0.3)", "textDetThresh", "0.3");
-      numericSetting("Box detection threshold", "textDetBoxThresh (e.g. 0.6)", "textDetBoxThresh", "0.6");
-      numericSetting("Unclip ratio", "textDetUnclipRatio (e.g. 1.6)", "textDetUnclipRatio", "1.6");
-      numericSetting("Recognition score threshold", "textRecScoreThresh (e.g. 0.5)", "textRecScoreThresh", "0.5");
-      numericSetting("Detection side length limit", "textDetLimitSideLen (e.g. 960)", "textDetLimitSideLen", "960");
-
-      new Setting(containerEl)
-        .setName("Side length limit type")
-        .setDesc("Whether the limit applies to the min or max side.")
-        .addDropdown((drop) =>
-          drop
-            .addOption("", "Server default")
-            .addOption("min", "min")
-            .addOption("max", "max")
-            .setValue(this.plugin.settings.textDetLimitType ?? "")
-            .onChange(async (value) => {
-              this.plugin.settings.textDetLimitType =
-                value === "" ? null : (value as "min" | "max");
-              await this.plugin.saveSettings();
-            })
-        );
-    }
 
     // ── Diagnostics ───────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Diagnostics" });
@@ -1038,39 +720,35 @@ export default class OcrImagePlugin extends Plugin {
       verbose: this.settings.devMode,
     });
 
-    // If mode is local or auto, and runtime is already installed, warm up the
-    // engine in the background so the first OCR call is fast.
-    if (
-      this.settings.ocrMode !== "remote" &&
-      isRuntimeInstalled(pluginDir)
-    ) {
+    // If runtime is already installed, warm up the engine in the background
+    // so the first OCR call is fast.
+    if (isRuntimeInstalled(pluginDir)) {
       this.localEngine.initialize().catch((err) => {
-        console.error("[ocr-image] Background engine init failed:", err);
+        console.error("[text-lens] Background engine init failed:", err);
       });
     }
 
     this.addSettingTab(new OcrImageSettingTab(this.app, this));
 
     this.addCommand({
-      id: "ocr-images-in-current-note",
-      name: "OCR Images in Current Note",
+      id: "text-lens-ocr-current-note",
+      name: "TextLens: OCR Current Note",
       editorCallback: async (editor: Editor, view: MarkdownView) => {
         const activeFile = view.file;
         if (!activeFile) {
-          new Notice("OCR Images: no active file.");
+          new Notice("TextLens: no active file.");
           return;
         }
 
-        // If local mode is requested but engine not yet initialised, do it now
-        // with a user-visible notice.
-        if (this.settings.ocrMode !== "remote" && !this.localEngine.ready) {
+        // If the engine is not yet initialised, do it now with a user-visible notice.
+        if (!this.localEngine.ready) {
           if (!isRuntimeInstalled(pluginDir)) {
             // Runtime binaries are absent — tell the user and abort.  Without
             // this guard the engine stays uninitialised but runOcr() would still
             // call recognize() in "local" mode, throwing a cryptic internal error.
             new Notice(
               "Local OCR runtime is not installed.\n" +
-              "Open Settings → OCR Images → Local OCR Engine and click \"Setup\".",
+              "Open Settings → TextLens → Local OCR Engine and click \"Setup\".",
               8000
             );
             return;
@@ -1084,7 +762,7 @@ export default class OcrImagePlugin extends Plugin {
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             new Notice(`Local OCR engine failed to load:\n${msg}`, 10000);
-            console.error("[ocr-image] Engine init failed:", err);
+            console.error("[text-lens] Engine init failed:", err);
           } finally {
             initNotice.hide();
           }
@@ -1094,7 +772,7 @@ export default class OcrImagePlugin extends Plugin {
         try {
           await processNote(this.app, this, editor, activeFile);
         } catch (err) {
-          console.error("[ocr-image] Unexpected error in processNote:", err);
+          console.error("[text-lens] Unexpected error in processNote:", err);
           new Notice(
             `OCR failed unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
             8000
@@ -1108,7 +786,7 @@ export default class OcrImagePlugin extends Plugin {
     try {
       await this.localEngine?.destroy();
     } catch (err) {
-      console.error("[ocr-image] Error during engine cleanup on unload:", err);
+      console.error("[text-lens] Error during engine cleanup on unload:", err);
     }
   }
 

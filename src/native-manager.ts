@@ -26,6 +26,7 @@
  */
 
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as zlib from "zlib";
 
@@ -34,7 +35,7 @@ import * as zlib from "zlib";
 const ORT_VERSION = "1.27.0";
 const NAPI_CANVAS_VERSION = "1.0.0";
 
-const GITHUB_REPO = "Nexround/obsidian-ocr-image";
+const GITHUB_REPO = "Nexround/obsidian-text-lens";
 
 const ORT_TARBALL_URL =
   `https://registry.npmjs.org/onnxruntime-node/-/onnxruntime-node-${ORT_VERSION}.tgz`;
@@ -263,4 +264,31 @@ export function prependPluginModulePath(pluginDir: string): void {
   if (!Module.globalPaths.includes(dir)) {
     Module.globalPaths.unshift(dir);
   }
+}
+
+/**
+ * Remove all runtime binaries installed by installRuntime() by deleting the
+ * plugin's node_modules directory.  Safe to call even if the directory does
+ * not exist.  The user can re-install via installRuntime() at any time.
+ */
+export async function uninstallRuntime(pluginDir: string): Promise<void> {
+  const nmDir = path.join(pluginDir, "node_modules");
+  if (fs.existsSync(nmDir)) {
+    fs.rmSync(nmDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Delete the ppu-paddle-ocr model weight cache stored outside the plugin
+ * directory.  Returns whether a cache directory was actually found and
+ * deleted, along with its path, so callers can surface the information to
+ * the user.
+ */
+export async function clearModelCache(): Promise<{ deleted: boolean; cachePath: string }> {
+  const cachePath = path.join(os.homedir(), ".cache", "ppu-paddle-ocr");
+  const deleted = fs.existsSync(cachePath);
+  if (deleted) {
+    fs.rmSync(cachePath, { recursive: true, force: true });
+  }
+  return { deleted, cachePath };
 }

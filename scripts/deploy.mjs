@@ -13,7 +13,7 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_SRC = path.resolve(__dirname, "..");
-const VAULT_PLUGIN_DIR = "/Users/wangrunyu/Documents/Obsidian Vault/.obsidian/plugins/ocr-image";
+const VAULT_PLUGIN_DIR = "/Users/wangrunyu/Documents/Obsidian Vault/.obsidian/plugins/text-lens";
 
 const { platform, arch } = process;
 
