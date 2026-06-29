@@ -67,9 +67,10 @@ interface OcrApiResponse {
   result?: {
     ocrResults: Array<{
       prunedResult: {
-        texts: string[];
-        scores?: number[];
-        boxes?: number[][];
+        texts: string[];       // always empty in current server version
+        rec_texts: string[];   // actual recognized text lines
+        rec_scores?: number[];
+        rec_boxes?: number[][];
       };
       ocrImage: string | null;
     }>;
@@ -134,7 +135,7 @@ function extractImages(content: string): ImageMatch[] {
   return matches;
 }
 
-// ── Vault → Base64 ────────────────────────────────────────────────────────────
+// ── Vault → Buffer / Base64 ───────────────────────────────────────────────────
 
 /**
  * Convert ArrayBuffer to base64 in 8192-byte chunks to avoid
@@ -150,24 +151,28 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-async function fileToBase64(app: App, imageSrc: string, activeFile: TFile): Promise<string> {
+/**
+ * Fetch a vault image as an ArrayBuffer.
+ * Uses Obsidian's app:// resource protocol so it bypasses macOS sandbox
+ * restrictions (e.g. files downloaded by App Store apps like RedNote).
+ */
+async function fileToArrayBuffer(app: App, imageSrc: string, activeFile: TFile): Promise<ArrayBuffer> {
   let file: TFile | null = null;
 
   // Strategy 1: exact vault path
   const exact = app.vault.getAbstractFileByPath(imageSrc);
-  if (exact instanceof TFile) {
-    file = exact;
-  }
+  if (exact instanceof TFile) file = exact;
 
   // Strategy 2: Obsidian wikilink resolution via metadataCache
   if (!file) {
     const resolved = app.metadataCache.getFirstLinkpathDest(imageSrc, activeFile.path);
-    if (resolved instanceof TFile) {
-      file = resolved;
-    }
+    if (resolved instanceof TFile) file = resolved;
   }
 
-  // Strategy 3: vault-wide basename search
+  // Strategy 3: vault-wide basename search — used only when the exact path and
+  // metadataCache lookup both fail (e.g. broken wikilink or non-indexed file).
+  // getFiles() is O(n) over the vault; acceptable here because this branch is
+  // rarely hit and there is no API to search by basename alone.
   if (!file) {
     const basename = imageSrc.split("/").pop() ?? imageSrc;
     const allFiles = app.vault.getFiles();
@@ -181,11 +186,20 @@ async function fileToBase64(app: App, imageSrc: string, activeFile: TFile): Prom
     throw new Error(`Image file not found in vault: ${imageSrc}`);
   }
 
-  const buffer = await app.vault.readBinary(file);
-  return arrayBufferToBase64(buffer);
+  const resourcePath = app.vault.getResourcePath(file);
+  const resp = await fetch(resourcePath);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch image (${resp.status} ${resp.statusText}): ${resourcePath}`);
+  }
+  return resp.arrayBuffer();
 }
 
-// ── OCR API call ──────────────────────────────────────────────────────────────
+async function fileToBase64(app: App, imageSrc: string, activeFile: TFile): Promise<string> {
+  const buf = await fileToArrayBuffer(app, imageSrc, activeFile);
+  return arrayBufferToBase64(buf);
+}
+
+// ── Remote OCR API call ───────────────────────────────────────────────────────
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
@@ -201,14 +215,9 @@ async function callOcrApi(
   fileOrUrl: string,
   isUrl: boolean
 ): Promise<string[]> {
-  const body: OcrApiRequest = {
-    file: fileOrUrl,
-  };
+  const body: OcrApiRequest = { file: fileOrUrl };
 
-  // For base64 uploads, tell the server it's an image (fileType=1)
   if (!isUrl) body.fileType = 1;
-
-  // Append optional params only when non-default
   if (settings.useDocOrientationClassify) body.useDocOrientationClassify = true;
   if (settings.useDocUnwarping) body.useDocUnwarping = true;
   if (settings.useTextlineOrientation) body.useTextlineOrientation = true;
@@ -232,7 +241,7 @@ async function callOcrApi(
     }
     const ocrResult = data.result?.ocrResults?.[0];
     if (!ocrResult) return [];
-    return ocrResult.prunedResult.texts ?? [];
+    return ocrResult.prunedResult.rec_texts ?? [];
   });
 
   return withTimeout(fetchPromise, 60_000);
