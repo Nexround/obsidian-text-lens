@@ -14,9 +14,12 @@ import {
 
 interface OcrImageSettings {
   apiUrl: string;
+  // Output
   outputFormat: "callout" | "codeblock";
   skipAlreadyProcessed: boolean;
-  // OCR enhancement toggles
+  // Post-processing
+  useTextRefinement: boolean;
+  // OCR enhancement toggles (remote only)
   useDocOrientationClassify: boolean;
   useDocUnwarping: boolean;
   useTextlineOrientation: boolean;
@@ -33,6 +36,7 @@ const DEFAULT_SETTINGS: OcrImageSettings = {
   apiUrl: "http://runyu.wang:6181/ocr",
   outputFormat: "callout",
   skipAlreadyProcessed: true,
+  useTextRefinement: true,
   useDocOrientationClassify: false,
   useDocUnwarping: false,
   useTextlineOrientation: false,
@@ -199,6 +203,160 @@ async function fileToBase64(app: App, imageSrc: string, activeFile: TFile): Prom
   return arrayBufferToBase64(buf);
 }
 
+// ── Spatial layout ────────────────────────────────────────────────────────────
+
+const ROW_OVERLAP_RATIO = 0.6;
+/** Gap between rows exceeding this multiple of average row height → paragraph break */
+const PARAGRAPH_GAP_RATIO = 1.8;
+
+/** Internal row representation used for layout and paragraph analysis */
+interface RowGroup {
+  text: string;
+  minY: number;
+  maxY: number;
+}
+
+/**
+ * Core layout analysis: cluster individual OCR boxes into visual rows sorted in
+ * reading order (top-to-bottom, left-to-right within each row).
+ */
+function buildRowGroups(texts: string[], boxes: number[][]): RowGroup[] {
+  const items = texts.map((text, i) => {
+    const [x1, y1, x2, y2] = boxes[i];
+    return { text, cx: (x1 + x2) / 2, cy: (y1 + y2) / 2, h: y2 - y1 };
+  });
+
+  items.sort((a, b) => a.cy - b.cy);
+
+  const rawRows: (typeof items)[] = [];
+  for (const item of items) {
+    const row = rawRows.find((r) => {
+      const rowCy = r.reduce((s, x) => s + x.cy, 0) / r.length;
+      const rowH  = Math.max(...r.map((x) => x.h));
+      return Math.abs(item.cy - rowCy) < Math.max(item.h, rowH) * ROW_OVERLAP_RATIO;
+    });
+    if (row) row.push(item);
+    else rawRows.push([item]);
+  }
+
+  // Sort rows top-to-bottom, then build RowGroup records
+  rawRows.sort((a, b) => {
+    const aCy = a.reduce((s, x) => s + x.cy, 0) / a.length;
+    const bCy = b.reduce((s, x) => s + x.cy, 0) / b.length;
+    return aCy - bCy;
+  });
+
+  return rawRows.map((row) => {
+    const sorted = [...row].sort((a, b) => a.cx - b.cx);
+    return {
+      text: sorted.map((x) => x.text).join("  "),
+      minY: Math.min(...row.map((x) => x.cy - x.h / 2)),
+      maxY: Math.max(...row.map((x) => x.cy + x.h / 2)),
+    };
+  });
+}
+
+/**
+ * Group OCR text boxes into reading-order rows using bounding-box coordinates.
+ */
+function groupTextByRows(texts: string[], boxes: number[][]): string[] {
+  if (texts.length === 0) return [];
+  if (texts.length !== boxes.length) return texts;
+  return buildRowGroups(texts, boxes).map((r) => r.text);
+}
+
+/**
+ * Like groupTextByRows, but also inserts "" (empty string) between rows whose
+ * vertical gap indicates a paragraph break. The empty strings act as hard-break
+ * markers consumed by refineLineBreaks().
+ */
+function groupTextByRowsWithParagraphs(texts: string[], boxes: number[][]): string[] {
+  if (texts.length === 0) return [];
+  if (texts.length !== boxes.length) return texts;
+
+  const rows = buildRowGroups(texts, boxes);
+  if (rows.length === 0) return texts;
+
+  const avgH = rows.reduce((s, r) => s + (r.maxY - r.minY), 0) / rows.length;
+
+  const result: string[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    result.push(rows[i].text);
+    if (i < rows.length - 1) {
+      const gap = rows[i + 1].minY - rows[i].maxY;
+      if (gap > avgH * PARAGRAPH_GAP_RATIO) result.push(""); // paragraph marker
+    }
+  }
+  return result;
+}
+
+// ── Line-break refinement ─────────────────────────────────────────────────────
+
+/** Sentence-ending punctuation (Chinese + English) */
+const SENT_END_RE = /[。！？…；!?]$/;
+/** English hyphenated line-break */
+const HYPHEN_END_RE = /-$/;
+/** List / numbered-item starters that must always begin on their own line */
+const LIST_START_RE = /^(?:\d+[.、。）)]\s|[①②③④⑤⑥⑦⑧⑨⑩]\s?|[•·▪▸\-*]\s)/;
+
+/**
+ * Merge OCR text lines that are visual soft-wraps into natural prose lines.
+ *
+ * Empty strings in `texts` are treated as hard paragraph boundaries inserted by
+ * groupTextByRowsWithParagraphs() and are preserved so that the final join("\n")
+ * produces blank-line paragraph separation in the output.
+ *
+ * Merge decision (for two adjacent non-empty lines A → B):
+ *  - A ends with sentence-terminating punctuation → hard break, keep.
+ *  - B looks like a list item → hard break, keep.
+ *  - A ends with "-" → English hyphenated wrap: strip hyphen and join directly.
+ *  - Both sides are ASCII word characters at the join point → join with a space.
+ *  - Otherwise (CJK content) → join directly, no space.
+ */
+function refineLineBreaks(texts: string[]): string[] {
+  if (texts.length <= 1) return texts;
+
+  const out: string[] = [];
+  let buf = "";
+
+  for (const line of texts) {
+    // Hard paragraph boundary — flush current buffer, emit the marker
+    if (line === "") {
+      if (buf !== "") { out.push(buf); buf = ""; }
+      out.push("");
+      continue;
+    }
+
+    // Start a new buffer
+    if (buf === "") {
+      buf = line;
+      continue;
+    }
+
+    const shouldMerge =
+      !SENT_END_RE.test(buf) &&
+      !LIST_START_RE.test(line);
+
+    if (shouldMerge) {
+      if (HYPHEN_END_RE.test(buf)) {
+        // Drop the hyphen and join
+        buf = buf.slice(0, -1) + line;
+      } else {
+        // Insert a space only when both join sides are ASCII word characters
+        const needsSpace =
+          /[a-zA-Z0-9]$/.test(buf) && /^[a-zA-Z0-9]/.test(line);
+        buf = buf + (needsSpace ? " " : "") + line;
+      }
+    } else {
+      out.push(buf);
+      buf = line;
+    }
+  }
+
+  if (buf !== "") out.push(buf);
+  return out;
+}
+
 // ── Remote OCR API call ───────────────────────────────────────────────────────
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -241,7 +399,9 @@ async function callOcrApi(
     }
     const ocrResult = data.result?.ocrResults?.[0];
     if (!ocrResult) return [];
-    return ocrResult.prunedResult.rec_texts ?? [];
+    const texts = ocrResult.prunedResult.rec_texts ?? [];
+    const boxes = ocrResult.prunedResult.rec_boxes ?? [];
+    return groupTextByRowsWithParagraphs(texts, boxes);
   });
 
   return withTimeout(fetchPromise, 60_000);
@@ -320,7 +480,10 @@ async function processNote(
         ? img.src
         : await fileToBase64(app, img.src, activeFile);
 
-      const texts = await callOcrApi(plugin.settings, fileOrUrl, img.isUrl);
+      const rawTexts = await callOcrApi(plugin.settings, fileOrUrl, img.isUrl);
+      const texts = plugin.settings.useTextRefinement
+        ? refineLineBreaks(rawTexts)
+        : rawTexts;
 
       if (texts.length > 0) {
         const insertion = formatOcrText(texts, plugin.settings.outputFormat, img.src);
@@ -397,6 +560,21 @@ class OcrImageSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.skipAlreadyProcessed).onChange(async (value) => {
           this.plugin.settings.skipAlreadyProcessed = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Merge wrapped lines")
+      .setDesc(
+        "Automatically join OCR lines that are visual soft-wraps " +
+        "(e.g. a paragraph split across image rows). " +
+        "Lines ending with sentence punctuation (。！？ etc.) and list items " +
+        "are always kept separate."
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.useTextRefinement).onChange(async (value) => {
+          this.plugin.settings.useTextRefinement = value;
           await this.plugin.saveSettings();
         })
       );
