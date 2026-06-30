@@ -138,7 +138,16 @@ async function fileToArrayBuffer(app: App, imageSrc: string, activeFile: TFile):
     throw new Error(`Image file not found in vault: ${imageSrc}`);
   }
 
-  return app.vault.readBinary(file);
+  // Use window.fetch with the Electron app:// resource path so the request is
+  // served by Electron's main-process protocol handler. This bypasses macOS
+  // sandbox restrictions on quarantined files (com.apple.provenance) that would
+  // cause fs.readFile (used by vault.readBinary) to fail with EPERM.
+  const resourcePath = app.vault.getResourcePath(file);
+  const resp = await window.fetch(resourcePath);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch image (${resp.status} ${resp.statusText}): ${resourcePath}`);
+  }
+  return resp.arrayBuffer();
 }
 // ── Line-break refinement ─────────────────────────────────────────────────────
 
