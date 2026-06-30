@@ -415,7 +415,7 @@ class ConfirmModal extends Modal {
       .addButton((btn) =>
         btn
           .setButtonText(this.confirmLabel)
-          .setDestructive()
+          .setWarning()
           .onClick(() => {
             this.close();
             void this.onConfirm();
