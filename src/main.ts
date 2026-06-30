@@ -104,9 +104,9 @@ function extractImages(content: string): ImageMatch[] {
 }
 
 /**
- * Fetch a vault image as an ArrayBuffer.
- * Uses Obsidian's app:// resource protocol so it bypasses macOS sandbox
- * restrictions (e.g. files downloaded by App Store apps like RedNote).
+ * Resolve a vault image reference and return its binary content.
+ * Tries three strategies in order: exact vault path, metadataCache wikilink
+ * resolution, and vault-wide basename search.
  */
 async function fileToArrayBuffer(app: App, imageSrc: string, activeFile: TFile): Promise<ArrayBuffer> {
   let file: TFile | null = null;
@@ -138,17 +138,7 @@ async function fileToArrayBuffer(app: App, imageSrc: string, activeFile: TFile):
     throw new Error(`Image file not found in vault: ${imageSrc}`);
   }
 
-  const resourcePath = app.vault.getResourcePath(file);
-  // `requestUrl` only supports http/https. The vault resource path uses the
-  // Electron-internal app:// protocol, which must be fetched via the browser's
-  // native fetch so Electron's main-process handler can serve it and bypass
-  // macOS sandbox restrictions on quarantined files (com.apple.provenance).
-  // eslint-disable-next-line no-restricted-globals -- intentional: app:// protocol requires native fetch, not requestUrl
-  const resp = await fetch(resourcePath);
-  if (!resp.ok) {
-    throw new Error(`Failed to fetch image (${resp.status} ${resp.statusText}): ${resourcePath}`);
-  }
-  return resp.arrayBuffer();
+  return app.vault.readBinary(file);
 }
 // ── Line-break refinement ─────────────────────────────────────────────────────
 
@@ -442,8 +432,6 @@ class OcrImageSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-
-    new Setting(containerEl).setName("TextLens").setHeading();
 
     // ── Local engine setup ────────────────────────────────────────────────────
     new Setting(containerEl).setName("Local OCR Engine").setHeading();

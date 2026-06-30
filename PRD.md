@@ -182,7 +182,7 @@ Obsidian Plugin (Electron Renderer — app:// context)
 | 性能 | N 张图片总耗时 ≈ max(单张响应时间) × ⌈N / maxConcurrency⌉，较串行提速最高 maxConcurrency 倍 |
 | 可靠性 | 单张图片失败不中断整批，最终汇报成功/失败数量；所有异步路径均有 try/catch，错误必输出到控制台 |
 | 安全性 | 图片数据仅在本地处理，零外传；运行时二进制从 npm registry 和 GitHub Release 官方地址下载 |
-| 兼容性 | Obsidian ≥ 1.7.2，仅桌面端（需要文件系统访问及 Node.js 集成） |
+| 兼容性 | Obsidian ≥ 1.13.0，仅桌面端（需要文件系统访问及 Node.js 集成） |
 | 可维护性 | 三个源文件职责明确；deploy 脚本自动处理所有平台差异 |
 | 可观测性 | 开发者模式输出每张图片的原始 OCR 结果；所有错误均以 `[text-lens]` 前缀输出到控制台 |
 

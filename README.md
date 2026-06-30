@@ -16,7 +16,7 @@ An [Obsidian](https://obsidian.md) plugin that scans the active note for image r
 
 ## Requirements
 
-- Obsidian ≥ 1.7.2 (desktop only — Windows, macOS, Linux)
+- Obsidian ≥ 1.13.0 (desktop only — Windows, macOS, Linux)
 - One-time runtime setup (~40 MB download): **Settings → TextLens → Local OCR Engine → Setup**
 
 ## Installation
