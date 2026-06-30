@@ -103,22 +103,6 @@ function extractImages(content: string): ImageMatch[] {
   return matches;
 }
 
-// ── Vault → Buffer / Base64 ───────────────────────────────────────────────────
-
-/**
- * Convert ArrayBuffer to base64 in 8192-byte chunks to avoid
- * stack overflow on large images when calling btoa with a big string.
- */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const CHUNK = 8192;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...Array.from(bytes.subarray(i, i + CHUNK)));
-  }
-  return btoa(binary);
-}
-
 /**
  * Fetch a vault image as an ArrayBuffer.
  * Uses Obsidian's app:// resource protocol so it bypasses macOS sandbox
@@ -155,6 +139,11 @@ async function fileToArrayBuffer(app: App, imageSrc: string, activeFile: TFile):
   }
 
   const resourcePath = app.vault.getResourcePath(file);
+  // `requestUrl` only supports http/https. The vault resource path uses the
+  // Electron-internal app:// protocol, which must be fetched via the browser's
+  // native fetch so Electron's main-process handler can serve it and bypass
+  // macOS sandbox restrictions on quarantined files (com.apple.provenance).
+  // eslint-disable-next-line no-restricted-globals -- intentional: app:// protocol requires native fetch, not requestUrl
   const resp = await fetch(resourcePath);
   if (!resp.ok) {
     throw new Error(`Failed to fetch image (${resp.status} ${resp.statusText}): ${resourcePath}`);
@@ -294,7 +283,7 @@ async function withConcurrency<T>(
   thunks: Array<() => Promise<T>>,
   limit: number
 ): Promise<T[]> {
-  const results: T[] = new Array(thunks.length);
+  const results: T[] = new Array<T>(thunks.length);
   let next = 0;
 
   async function worker(): Promise<void> {
@@ -414,7 +403,7 @@ class ConfirmModal extends Modal {
     private title: string,
     private body: string,
     private confirmLabel: string,
-    private onConfirm: () => void,
+    private onConfirm: () => void | Promise<void>,
   ) {
     super(app);
   }
@@ -427,10 +416,10 @@ class ConfirmModal extends Modal {
       .addButton((btn) =>
         btn
           .setButtonText(this.confirmLabel)
-          .setWarning()
+          .setDestructive()
           .onClick(() => {
             this.close();
-            this.onConfirm();
+            void this.onConfirm();
           })
       );
   }
@@ -454,10 +443,10 @@ class OcrImageSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "TextLens" });
+    new Setting(containerEl).setName("TextLens").setHeading();
 
     // ── Local engine setup ────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Local OCR Engine" });
+    new Setting(containerEl).setName("Local OCR Engine").setHeading();
 
       const pluginDir = (this.plugin.app.vault.adapter as FileSystemAdapter).basePath +
         `/.obsidian/plugins/${this.plugin.manifest.id}`;
@@ -570,7 +559,7 @@ class OcrImageSettingTab extends PluginSettingTab {
             "The engine will be unloaded first. You can re-install via \"Setup\"."
           )
           .addButton((btn) =>
-            btn.setButtonText("Delete").setWarning().onClick(() => {
+            btn.setButtonText("Delete").setDestructive().onClick(() => {
               new ConfirmModal(
                 this.plugin.app,
                 "Delete runtime files?",
@@ -600,7 +589,7 @@ class OcrImageSettingTab extends PluginSettingTab {
           "Models will be re-downloaded automatically on next OCR run."
         )
         .addButton((btn) =>
-          btn.setButtonText("Clear").setWarning().onClick(() => {
+          btn.setButtonText("Clear").setDestructive().onClick(() => {
             new ConfirmModal(
               this.plugin.app,
               "Clear model cache?",
@@ -626,7 +615,7 @@ class OcrImageSettingTab extends PluginSettingTab {
         );
 
     // ── Output ────────────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Output" });
+    new Setting(containerEl).setName("Output").setHeading();
 
     new Setting(containerEl)
       .setName("Output format")
@@ -683,7 +672,7 @@ class OcrImageSettingTab extends PluginSettingTab {
       );
 
     // ── Diagnostics ───────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Diagnostics" });
+    new Setting(containerEl).setName("Diagnostics").setHeading();
 
     new Setting(containerEl)
       .setName("Developer mode")
@@ -731,8 +720,8 @@ export default class OcrImagePlugin extends Plugin {
     this.addSettingTab(new OcrImageSettingTab(this.app, this));
 
     this.addCommand({
-      id: "text-lens-ocr-current-note",
-      name: "TextLens: OCR Current Note",
+      id: "ocr-current-note",
+      name: "OCR Current Note",
       editorCallback: async (editor: Editor, view: MarkdownView) => {
         const activeFile = view.file;
         if (!activeFile) {
@@ -782,16 +771,14 @@ export default class OcrImagePlugin extends Plugin {
     });
   }
 
-  async onunload() {
-    try {
-      await this.localEngine?.destroy();
-    } catch (err) {
+  onunload() {
+    void this.localEngine?.destroy().catch((err: unknown) => {
       console.error("[text-lens] Error during engine cleanup on unload:", err);
-    }
+    });
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<OcrImageSettings>);
   }
 
   async saveSettings() {

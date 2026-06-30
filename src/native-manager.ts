@@ -65,21 +65,21 @@ function parseTar(
   let offset = 0;
 
   while (offset + 512 <= tarBuf.length) {
-    const header = tarBuf.slice(offset, offset + 512);
+    const header = tarBuf.subarray(offset, offset + 512);
     if (header.every((b) => b === 0)) break;
 
-    const nameRaw = header.slice(0, 100).toString("ascii").replace(/\0.*$/, "");
-    const prefix  = header.slice(345, 500).toString("ascii").replace(/\0.*$/, "");
+    const nameRaw = header.subarray(0, 100).toString("ascii").replace(/\0.*$/, "");
+    const prefix  = header.subarray(345, 500).toString("ascii").replace(/\0.*$/, "");
     const fullPath = prefix ? `${prefix}/${nameRaw}` : nameRaw;
 
-    const sizeStr = header.slice(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
+    const sizeStr = header.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
     const size    = parseInt(sizeStr, 8) || 0;
     const typeFlag = String.fromCharCode(header[156]);
 
     offset += 512;
 
     if (typeFlag === "0" || typeFlag === "\0") {
-      onFile(fullPath, tarBuf.slice(offset, offset + size));
+      onFile(fullPath, tarBuf.subarray(offset, offset + size));
     }
 
     offset += Math.ceil(size / 512) * 512;
@@ -92,7 +92,7 @@ async function fetchBytes(url: string): Promise<Buffer> {
   // `obsidian` is a virtual module injected by Electron — it has no file path,
   // so dynamic import() (which uses the browser ESM resolver) cannot find it.
   // require() uses the CJS resolver which resolves virtual/built-in modules correctly.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports -- obsidian is a virtual Electron module with no resolvable file path; dynamic import() fails in the app:// renderer context
   const { requestUrl } = require("obsidian") as typeof import("obsidian");
   const resp = await requestUrl({ url, method: "GET", throw: true });
   return Buffer.from(resp.arrayBuffer);
@@ -258,7 +258,7 @@ export async function installRuntime(
  * Call this once at plugin load, before any import of ppu-paddle-ocr.
  */
 export function prependPluginModulePath(pluginDir: string): void {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports -- Node.js built-in 'module' must be loaded via CJS require(); ESM import() of built-ins is unavailable in the Obsidian renderer bundle
   const Module = require("module") as { globalPaths: string[] };
   const dir = path.join(pluginDir, "node_modules");
   if (!Module.globalPaths.includes(dir)) {
