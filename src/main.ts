@@ -556,7 +556,7 @@ class OcrImageSettingTab extends PluginSettingTab {
             "The engine will be unloaded first. You can re-install via \"Setup\"."
           )
           .addButton((btn) =>
-            btn.setButtonText("Delete").setDestructive().onClick(() => {
+            btn.setButtonText("Delete").setWarning().onClick(() => {
               new ConfirmModal(
                 this.plugin.app,
                 "Delete runtime files?",
@@ -586,7 +586,7 @@ class OcrImageSettingTab extends PluginSettingTab {
           "Models will be re-downloaded automatically on next OCR run."
         )
         .addButton((btn) =>
-          btn.setButtonText("Clear").setDestructive().onClick(() => {
+          btn.setButtonText("Clear").setWarning().onClick(() => {
             new ConfirmModal(
               this.plugin.app,
               "Clear model cache?",
