@@ -212,22 +212,6 @@ function refineLineBreaks(texts: string[]): string[] {
   return out;
 }
 
-// ── OCR dispatch ─────────────────────────────────────────────────────────────
-
-/** Run OCR on a single vault image using the local engine. */
-async function runOcr(
-  plugin: OcrImagePlugin,
-  app: App,
-  img: ImageMatch,
-  activeFile: TFile
-): Promise<string[]> {
-  if (img.isUrl) {
-    throw new Error("URL images are not supported in local-only mode");
-  }
-  const buf = await fileToArrayBuffer(app, img.src, activeFile);
-  return plugin.localEngine.recognize(buf);
-}
-
 // ── Output formatting ─────────────────────────────────────────────────────────
 
 function formatOcrText(
@@ -276,27 +260,6 @@ function removeOcrBlock(content: string, insertPos: number): string {
   return content;
 }
 
-// ── Concurrency helper ────────────────────────────────────────────────────────
-
-async function withConcurrency<T>(
-  thunks: Array<() => Promise<T>>,
-  limit: number
-): Promise<T[]> {
-  const results: T[] = new Array<T>(thunks.length);
-  let next = 0;
-
-  async function worker(): Promise<void> {
-    while (next < thunks.length) {
-      const i = next++;
-      results[i] = await thunks[i]();
-    }
-  }
-
-  const slots = Math.min(Math.max(limit, 1), thunks.length);
-  await Promise.all(Array.from({ length: slots }, worker));
-  return results;
-}
-
 // ── Main processing ───────────────────────────────────────────────────────────
 
 interface OcrTaskResult {
@@ -326,48 +289,110 @@ async function processNote(
 
   const label = isRerun ? "Re-OCR" : "OCR";
   const notice = new Notice(`${label}: 0 / ${images.length} done…`, 0);
-  let done = 0;
 
-  const thunks = images.map((img): (() => Promise<OcrTaskResult>) => async () => {
+  // ── Phase 1: Read all image buffers in parallel (I/O, not model inference) ──
+
+  const bufferSettled = await Promise.allSettled(
+    images.map((img) =>
+      img.isUrl
+        ? Promise.reject(new Error("URL images are not supported in local-only mode"))
+        : fileToArrayBuffer(app, img.src, activeFile)
+    )
+  );
+
+  // Determine which images need to go through the model.
+  // Build a dense toProcess array and a globalIndex → localIndex map so Phase 3
+  // can look up results without an O(n) search.
+  const toProcess: number[] = [];
+  const globalToLocal = new Map<number, number>();
+  for (let i = 0; i < images.length; i++) {
+    const insertPos = images[i].index + images[i].fullMatch.length;
+    if (!isRerun && plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(content, insertPos)) {
+      continue; // will be recorded as skipped in Phase 3
+    }
+    if (bufferSettled[i].status === "rejected") {
+      continue; // I/O failure; will be recorded as error in Phase 3
+    }
+    globalToLocal.set(i, toProcess.length);
+    toProcess.push(i);
+  }
+
+  // ── Phase 2: True batch model inference ────────────────────────────────────
+
+  // batchRecognize processes all images in one library call with bounded
+  // concurrency at the ONNX session level — this is real model-layer batching.
+  let batchResults: Awaited<ReturnType<LocalOcrEngine["batchRecognize"]>> = [];
+
+  if (toProcess.length > 0) {
+    const batchBuffers = toProcess.map(
+      (i) => (bufferSettled[i] as PromiseFulfilledResult<ArrayBuffer>).value
+    );
+    batchResults = await plugin.localEngine.batchRecognize(
+      batchBuffers,
+      plugin.settings.maxConcurrency,
+      (batchDone, batchTotal) => {
+        notice.setMessage(
+          `${label}: ${batchDone} / ${batchTotal ?? toProcess.length} done…`
+        );
+      }
+    );
+  }
+
+  // ── Phase 3: Map batch results back to per-image OcrTaskResult[] ────────────
+
+  const results: OcrTaskResult[] = images.map((img, i) => {
     const insertPos = img.index + img.fullMatch.length;
 
+    // Already-processed skip
     if (!isRerun && plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(content, insertPos)) {
-      notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
       return { img, texts: null, skipped: true, error: null };
     }
 
-    try {
-      const rawTexts = await runOcr(plugin, app, img, activeFile);
-
-      if (plugin.settings.devMode) {
-        console.log(`[text-lens] ${img.src.split("/").pop()} raw:`, rawTexts);
-      }
-
-      if (rawTexts.length === 0) throw new Error("OCR returned no text");
-
-      const texts = plugin.settings.useTextRefinement
-        ? refineLineBreaks(rawTexts)
-        : rawTexts;
-
-      if (plugin.settings.devMode && plugin.settings.useTextRefinement) {
-        console.log(`[text-lens] ${img.src.split("/").pop()} refined:`, texts);
-      }
-
-      notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
-      return { img, texts, skipped: false, error: null };
-    } catch (err) {
-      console.error(`[text-lens] Failed for "${img.src}":`, err);
-      notice.setMessage(`${label}: ${++done} / ${images.length} done…`);
-      return {
-        img,
-        texts: null,
-        skipped: false,
-        error: err instanceof Error ? err : new Error(String(err)),
-      };
+    // I/O failure (buffer read failed)
+    const bufResult = bufferSettled[i];
+    if (bufResult.status === "rejected") {
+      const err =
+        bufResult.reason instanceof Error
+          ? bufResult.reason
+          : new Error(String(bufResult.reason));
+      console.error(`[text-lens] I/O failed for "${img.src}":`, err);
+      return { img, texts: null, skipped: false, error: err };
     }
+
+    // Look up this image's batch result
+    const localIdx = globalToLocal.get(i)!;
+    const batchItem = batchResults[localIdx];
+
+    if (!batchItem || batchItem.status === "rejected") {
+      const reason =
+        batchItem?.status === "rejected" ? batchItem.reason : new Error("No batch result");
+      const err = reason instanceof Error ? reason : new Error(String(reason));
+      console.error(`[text-lens] OCR failed for "${img.src}":`, err);
+      return { img, texts: null, skipped: false, error: err };
+    }
+
+    const rawTexts = batchItem.value;
+
+    if (plugin.settings.devMode) {
+      console.log(`[text-lens] ${img.src.split("/").pop()} raw:`, rawTexts);
+    }
+
+    if (rawTexts.length === 0) {
+      return { img, texts: null, skipped: false, error: new Error("OCR returned no text") };
+    }
+
+    const texts = plugin.settings.useTextRefinement
+      ? refineLineBreaks(rawTexts)
+      : rawTexts;
+
+    if (plugin.settings.devMode && plugin.settings.useTextRefinement) {
+      console.log(`[text-lens] ${img.src.split("/").pop()} refined:`, texts);
+    }
+
+    return { img, texts, skipped: false, error: null };
   });
 
-  const results = await withConcurrency(thunks, plugin.settings.maxConcurrency);
+  // ── Write results back into the document ───────────────────────────────────
 
   let workingContent = content;
   for (const { img, texts } of [...results].sort((a, b) => b.img.index - a.img.index)) {
@@ -655,7 +680,7 @@ class OcrImageSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Max concurrency")
-      .setDesc("How many OCR requests to run in parallel (1–20).")
+      .setDesc("Maximum number of images the OCR model processes in parallel during batch inference (1–20).")
       .addText((text) =>
         text
           .setPlaceholder("3")
@@ -730,8 +755,8 @@ export default class OcrImagePlugin extends Plugin {
         if (!this.localEngine.ready) {
           if (!isRuntimeInstalled(pluginDir)) {
             // Runtime binaries are absent — tell the user and abort.  Without
-            // this guard the engine stays uninitialised but runOcr() would still
-            // call recognize() in "local" mode, throwing a cryptic internal error.
+            // this guard the engine stays uninitialised but batchRecognize() would still
+            // be called, throwing a cryptic internal error.
             new Notice(
               "Local OCR runtime is not installed.\n" +
               "Open Settings → TextLens → Local OCR Engine and click \"Setup\".",

@@ -50,7 +50,7 @@ Open any note that contains images, then open the command palette (`Cmd/Ctrl+P`)
 
 > **TextLens: OCR Current Note**
 
-The plugin processes each image concurrently and inserts the recognized text immediately below it.
+The plugin reads all image buffers in parallel, then sends them to the OCR model in a single batch call, and inserts the recognised text immediately below each image.
 
 ### Callout output (default)
 
@@ -92,7 +92,7 @@ This is recognized text
 | **Output format** | Callout | `> [!note]+` callout or ` ```ocr ` fenced block |
 | **Skip already-processed** | On | Don't re-OCR images that already have a block below them |
 | **Merge wrapped lines** | On | Join soft-wrapped OCR lines into natural prose; preserves paragraph gaps and list items |
-| **Max concurrency** | 3 | How many images to OCR in parallel (1–20) |
+| **Max concurrency** | 3 | Maximum number of images the OCR model processes in parallel during batch inference (1–20) |
 
 ### Diagnostics
 

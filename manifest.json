@@ -1,7 +1,7 @@
 {
   "id": "text-lens",
   "name": "TextLens",
-  "version": "1.3.7",
+  "version": "1.3.8",
   "minAppVersion": "1.7.2",
   "description": "OCR images in the current note using on-device PaddleOCR via ONNX Runtime — no server, no API key. Recognized text is inserted inline below each image.",
   "author": "wangrunyu",

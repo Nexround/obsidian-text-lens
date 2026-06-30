@@ -10,26 +10,18 @@
  *    native binary is present.
  *  - The service is initialised once and reused; destroy() is called on plugin
  *    unload.
- *  - Output mirrors the shape of callOcrApi() — string[] of text lines — so the
- *    rest of main.ts needs no changes.
+ *  - recognize() returns string[] of text lines for single-image use.
+ *    batchRecognize() accepts ArrayBuffer[] and delegates to the library's
+ *    native batch API for true model-layer parallelism.
  */
 
-import type { PaddleOcrService as PaddleOcrServiceType } from "ppu-paddle-ocr";
+import type {
+  PaddleOcrService as PaddleOcrServiceType,
+  BatchItemResult,
+  AnyOcrResult,
+} from "ppu-paddle-ocr";
 import { createRequire } from "module";
 import * as path from "path";
-
-// ── Types (keep in sync with ppu-paddle-ocr's public API) ─────────────────────
-
-interface OcrLine {
-  text: string;
-  confidence: number;
-}
-
-interface OcrResult {
-  text: string;
-  lines: OcrLine[][];
-  confidence: number;
-}
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
@@ -148,6 +140,29 @@ export class LocalOcrEngine {
   }
 
   /**
+   * Shared helper: extract reading-order text lines from any AnyOcrResult.
+   * Handles both PaddleOcrResult (.lines: RecognitionResult[][]) and
+   * FlattenedPaddleOcrResult (.results: RecognitionResult[]).
+   */
+  private _extractLines(result: AnyOcrResult): string[] {
+    const lines: string[] = [];
+    if ("lines" in result && Array.isArray(result.lines)) {
+      for (const row of result.lines) {
+        if (!Array.isArray(row)) continue;
+        const rowText = row.map((b) => b.text).join("  ").trim();
+        if (rowText) lines.push(rowText);
+      }
+      return lines;
+    }
+    if ("results" in result && Array.isArray(result.results)) {
+      for (const item of result.results) {
+        if (item.text?.trim()) lines.push(item.text.trim());
+      }
+    }
+    return lines;
+  }
+
+  /**
    * Run OCR on raw image bytes.
    * @param imageBuffer  ArrayBuffer containing the image (PNG, JPEG, etc.)
    * @returns            Array of recognised text lines in reading order.
@@ -156,21 +171,48 @@ export class LocalOcrEngine {
     if (!this.service) {
       throw new Error("LocalOcrEngine.initialize() has not been called.");
     }
+    const result = await this.service.recognize(imageBuffer, { strategy: "per-box" });
+    if (!result) return [];
+    return this._extractLines(result);
+  }
 
-    const result = await this.service.recognize(imageBuffer, { strategy: "per-box" }) as OcrResult;
-
-    if (!result || !result.lines) return [];
-
-    // result.lines is Line[][], where each Line[] is a row of text boxes.
-    // Flatten each row into a single string, then collect all rows.
-    const lines: string[] = [];
-    for (const row of result.lines) {
-      if (!Array.isArray(row)) continue;
-      const rowText = row.map((b: OcrLine) => b.text).join("  ").trim();
-      if (rowText) lines.push(rowText);
+  /**
+   * Run OCR on multiple images in a single batch call.
+   *
+   * Delegates to ppu-paddle-ocr's native batchRecognize() with settle:true
+   * so partial failures don't abort the whole batch. Results are index-aligned
+   * to the input array regardless of completion order.
+   *
+   * @param imageBuffers  Array of ArrayBuffers (one per image, document order).
+   * @param concurrency   Max parallel inference slots passed to the library.
+   * @param onProgress    Optional progress callback(done, total).
+   * @returns             BatchItemResult<string[]>[] index-aligned to inputs.
+   */
+  async batchRecognize(
+    imageBuffers: ArrayBuffer[],
+    concurrency: number | "auto",
+    onProgress?: (done: number, total: number | undefined) => void
+  ): Promise<BatchItemResult<string[]>[]> {
+    if (!this.service) {
+      throw new Error("LocalOcrEngine.initialize() has not been called.");
     }
 
-    return lines;
+    // settle:true ensures a single image failure doesn't abort the whole batch.
+    const rawResults = await this.service.batchRecognize(imageBuffers, {
+      strategy: "per-box",
+      concurrency,
+      settle: true,
+      onProgress,
+    });
+
+    return rawResults.map((item): BatchItemResult<string[]> => {
+      if (item.status === "rejected") return item;
+      return {
+        index: item.index,
+        status: "fulfilled",
+        value: this._extractLines(item.value),
+      };
+    });
   }
 
   /** Release ONNX inference sessions. Call from Plugin.onunload(). */
