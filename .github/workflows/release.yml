@@ -22,7 +22,15 @@ jobs:
           node-version: "lts/*"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
+
+      - name: Verify Release tag matches the plugin version
+        run: node -e "if (process.env.GITHUB_REF_NAME !== require('./manifest.json').version) throw new Error('Release tag must match manifest.json version')"
+
+      - name: Check types and regressions
+        run: |
+          npm run typecheck
+          npm test
 
       - name: Build plugin
         run: npm run build
@@ -37,11 +45,54 @@ jobs:
             main.js
             styles.css
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: plugin
+          path: |
             main.js
             manifest.json
             styles.css
             ppu-bundle.cjs
+
+  macos-helper:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+      - run: npm ci --ignore-scripts
+      - name: Build and ad-hoc sign Vision helper
+        run: npm run build:helper -- ${{ matrix.arch }}
+      - name: Verify real Vision recognition and installer
+        run: npm run probe:macos
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: build/native/text-lens-vision-darwin-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vision-${{ matrix.arch }}
+          path: |
+            build/native/text-lens-vision-darwin-${{ matrix.arch }}
+            build/native/text-lens-vision-darwin-${{ matrix.arch }}.sha256
+
+  release:
+    needs: [build, macos-helper]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
