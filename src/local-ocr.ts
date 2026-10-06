@@ -17,11 +17,11 @@
 
 import type {
   PaddleOcrService as PaddleOcrServiceType,
-  BatchItemResult,
   AnyOcrResult,
 } from "ppu-paddle-ocr";
 import { createRequire } from "module";
 import * as path from "path";
+import type { OcrEngine, OcrItemResult } from "./ocr-engine";
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
@@ -34,9 +34,10 @@ export interface LocalOcrOptions {
   verbose: boolean;
 }
 
-export class LocalOcrEngine {
+export class LocalOcrEngine implements OcrEngine {
   private service: PaddleOcrServiceType | null = null;
   private initPromise: Promise<void> | null = null;
+  private generation = 0;
   private readonly options: LocalOcrOptions;
 
   constructor(options: LocalOcrOptions) {
@@ -71,6 +72,7 @@ export class LocalOcrEngine {
   }
 
   private async _doInit(): Promise<void> {
+    const generation = this.generation;
     // ppu-paddle-ocr is ESM-only ("type":"module"). In Obsidian's Electron
     // renderer the page is served from the app:// protocol, so Chromium's
     // module fetcher blocks any dynamic import() that targets a file:// URL
@@ -130,7 +132,16 @@ export class LocalOcrEngine {
       console.log("[local-ocr] Initialising PaddleOcrService with model tier:", this.options.modelTier);
     }
 
-    await svc.initialize();
+    try {
+      await svc.initialize();
+    } catch (error) {
+      await svc.destroy();
+      throw error;
+    }
+    if (generation !== this.generation) {
+      await svc.destroy();
+      throw new Error("OCR initialization cancelled");
+    }
     // Only expose the service once it is fully ready.
     this.service = svc;
 
@@ -186,13 +197,13 @@ export class LocalOcrEngine {
    * @param imageBuffers  Array of ArrayBuffers (one per image, document order).
    * @param concurrency   Max parallel inference slots passed to the library.
    * @param onProgress    Optional progress callback(done, total).
-   * @returns             BatchItemResult<string[]>[] index-aligned to inputs.
+   * @returns             Plugin results index-aligned to inputs.
    */
   async batchRecognize(
     imageBuffers: ArrayBuffer[],
     concurrency: number | "auto",
     onProgress?: (done: number, total: number | undefined) => void
-  ): Promise<BatchItemResult<string[]>[]> {
+  ): Promise<OcrItemResult[]> {
     if (!this.service) {
       throw new Error("LocalOcrEngine.initialize() has not been called.");
     }
@@ -205,8 +216,8 @@ export class LocalOcrEngine {
       onProgress,
     });
 
-    return rawResults.map((item): BatchItemResult<string[]> => {
-      if (item.status === "rejected") return item;
+    return rawResults.map((item): OcrItemResult => {
+      if (item.status === "rejected") return { index: item.index, status: "rejected", reason: item.reason };
       return {
         index: item.index,
         status: "fulfilled",
@@ -217,6 +228,8 @@ export class LocalOcrEngine {
 
   /** Release ONNX inference sessions. Call from Plugin.onunload(). */
   async destroy(): Promise<void> {
+    this.generation++;
+    this.initPromise = null;
     if (this.service) {
       await this.service.destroy();
       this.service = null;

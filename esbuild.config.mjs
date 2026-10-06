@@ -30,6 +30,7 @@ const NATIVE_EXTERNALS = [
 const context = await esbuild.context({
   entryPoints: ["src/main.ts"],
   bundle: true,
+  loader: { ".ps1": "text" },
   external: [
     "obsidian",
     "electron",

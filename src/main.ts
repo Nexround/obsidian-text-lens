@@ -3,27 +3,26 @@ import {
   Editor,
   FileSystemAdapter,
   MarkdownView,
-  Modal,
   Notice,
   Plugin,
-  PluginSettingTab,
-  Setting,
   TFile,
 } from "obsidian";
 
 import {
   isRuntimeInstalled,
-  installRuntime,
-  uninstallRuntime,
-  clearModelCache,
   prependPluginModulePath,
-  type DownloadProgress,
 } from "./native-manager";
 import { LocalOcrEngine, type ModelTier } from "./local-ocr";
+import { NativeOcrEngine } from "./native-ocr";
+import type { OcrEngine, OcrItemResult } from "./ocr-engine";
+import { OcrImageSettingTab } from "./settings";
+import * as path from "path";
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 interface OcrImageSettings {
+  ocrSource: "paddle" | "native";
+  nativeLanguage: string;
   // Local OCR settings
   localModelTier: ModelTier;
   // Output
@@ -38,6 +37,8 @@ interface OcrImageSettings {
 }
 
 const DEFAULT_SETTINGS: OcrImageSettings = {
+  ocrSource: "paddle",
+  nativeLanguage: "auto",
   localModelTier: "small",
   outputFormat: "callout",
   skipAlreadyProcessed: true,
@@ -56,7 +57,7 @@ interface ImageMatch {
 }
 
 // Supported image extensions
-const IMG_EXT = "png|jpg|jpeg|gif|webp|bmp|svg|tiff|avif";
+const IMG_EXT = "png|jpg|jpeg|gif|webp|bmp|svg|tif|tiff|avif|heic|heif";
 
 // Pattern 1: Obsidian wikilink  ![[name.png]]  or  ![[name.png|alt]]
 const WIKILINK_IMG_RE = new RegExp(
@@ -289,536 +290,237 @@ async function processNote(
 
   const label = isRerun ? "Re-OCR" : "OCR";
   const notice = new Notice(`${label}: 0 / ${images.length} done…`, 0);
+  try {
 
-  // ── Phase 1: Read all image buffers in parallel (I/O, not model inference) ──
+    // ── Phase 1: Read all image buffers in parallel (I/O, not model inference) ──
 
-  const bufferSettled = await Promise.allSettled(
-    images.map((img) =>
-      img.isUrl
-        ? Promise.reject(new Error("URL images are not supported in local-only mode"))
-        : fileToArrayBuffer(app, img.src, activeFile)
-    )
-  );
-
-  // Determine which images need to go through the model.
-  // Build a dense toProcess array and a globalIndex → localIndex map so Phase 3
-  // can look up results without an O(n) search.
-  const toProcess: number[] = [];
-  const globalToLocal = new Map<number, number>();
-  for (let i = 0; i < images.length; i++) {
-    const insertPos = images[i].index + images[i].fullMatch.length;
-    if (!isRerun && plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(content, insertPos)) {
-      continue; // will be recorded as skipped in Phase 3
-    }
-    if (bufferSettled[i].status === "rejected") {
-      continue; // I/O failure; will be recorded as error in Phase 3
-    }
-    globalToLocal.set(i, toProcess.length);
-    toProcess.push(i);
-  }
-
-  // ── Phase 2: True batch model inference ────────────────────────────────────
-
-  // batchRecognize processes all images in one library call with bounded
-  // concurrency at the ONNX session level — this is real model-layer batching.
-  let batchResults: Awaited<ReturnType<LocalOcrEngine["batchRecognize"]>> = [];
-
-  if (toProcess.length > 0) {
-    const batchBuffers = toProcess.map(
-      (i) => (bufferSettled[i] as PromiseFulfilledResult<ArrayBuffer>).value
-    );
-    batchResults = await plugin.localEngine.batchRecognize(
-      batchBuffers,
-      plugin.settings.maxConcurrency,
-      (batchDone, batchTotal) => {
-        notice.setMessage(
-          `${label}: ${batchDone} / ${batchTotal ?? toProcess.length} done…`
-        );
-      }
-    );
-  }
-
-  // ── Phase 3: Map batch results back to per-image OcrTaskResult[] ────────────
-
-  const results: OcrTaskResult[] = images.map((img, i) => {
-    const insertPos = img.index + img.fullMatch.length;
-
-    // Already-processed skip
-    if (!isRerun && plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(content, insertPos)) {
-      return { img, texts: null, skipped: true, error: null };
-    }
-
-    // I/O failure (buffer read failed)
-    const bufResult = bufferSettled[i];
-    if (bufResult.status === "rejected") {
-      const err =
-        bufResult.reason instanceof Error
-          ? bufResult.reason
-          : new Error(String(bufResult.reason));
-      console.error(`[text-lens] I/O failed for "${img.src}":`, err);
-      return { img, texts: null, skipped: false, error: err };
-    }
-
-    // Look up this image's batch result
-    const localIdx = globalToLocal.get(i)!;
-    const batchItem = batchResults[localIdx];
-
-    if (!batchItem || batchItem.status === "rejected") {
-      const reason =
-        batchItem?.status === "rejected" ? batchItem.reason : new Error("No batch result");
-      const err = reason instanceof Error ? reason : new Error(String(reason));
-      console.error(`[text-lens] OCR failed for "${img.src}":`, err);
-      return { img, texts: null, skipped: false, error: err };
-    }
-
-    const rawTexts = batchItem.value;
-
-    if (plugin.settings.devMode) {
-      console.log(`[text-lens] ${img.src.split("/").pop()} raw:`, rawTexts);
-    }
-
-    if (rawTexts.length === 0) {
-      return { img, texts: null, skipped: false, error: new Error("OCR returned no text") };
-    }
-
-    const texts = plugin.settings.useTextRefinement
-      ? refineLineBreaks(rawTexts)
-      : rawTexts;
-
-    if (plugin.settings.devMode && plugin.settings.useTextRefinement) {
-      console.log(`[text-lens] ${img.src.split("/").pop()} refined:`, texts);
-    }
-
-    return { img, texts, skipped: false, error: null };
-  });
-
-  // ── Write results back into the document ───────────────────────────────────
-
-  let workingContent = content;
-  for (const { img, texts } of [...results].sort((a, b) => b.img.index - a.img.index)) {
-    if (!texts) continue;
-    const insertPos = img.index + img.fullMatch.length;
-    if (isRerun) workingContent = removeOcrBlock(workingContent, insertPos);
-    const insertion = formatOcrText(texts, plugin.settings.outputFormat, img.src);
-    workingContent =
-      workingContent.slice(0, insertPos) + insertion + workingContent.slice(insertPos);
-  }
-
-  editor.setValue(workingContent);
-
-  notice.hide();
-  const errors = results.filter((r) => r.error).length;
-  if (errors > 0) {
-    new Notice(
-      `OCR complete: ${results.length - errors} succeeded, ${errors} failed. Check console for details.`,
-      6000
-    );
-  } else {
-    new Notice(`OCR complete: ${results.length} image(s) processed.`, 4000);
-  }
-}
-
-// ── Confirmation modal ────────────────────────────────────────────────────────
-
-/** Generic two-button confirmation dialog used for destructive operations. */
-class ConfirmModal extends Modal {
-  constructor(
-    app: App,
-    private title: string,
-    private body: string,
-    private confirmLabel: string,
-    private onConfirm: () => void | Promise<void>,
-  ) {
-    super(app);
-  }
-
-  onOpen() {
-    this.contentEl.createEl("h3", { text: this.title });
-    this.contentEl.createEl("p", { text: this.body });
-    new Setting(this.contentEl)
-      .addButton((btn) => btn.setButtonText("取消").onClick(() => this.close()))
-      .addButton((btn) =>
-        btn
-          .setButtonText(this.confirmLabel)
-          .setWarning()
-          .onClick(() => {
-            this.close();
-            void this.onConfirm();
-          })
-      );
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-}
-
-// ── Settings tab ──────────────────────────────────────────────────────────────
-
-class OcrImageSettingTab extends PluginSettingTab {
-  plugin: OcrImagePlugin;
-
-  constructor(app: App, plugin: OcrImagePlugin) {
-    super(app, plugin);
-    this.plugin = plugin;
-  }
-
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
-
-    // ── Local engine setup ────────────────────────────────────────────────────
-    new Setting(containerEl).setName("Local OCR Engine").setHeading();
-
-      const pluginDir = (this.plugin.app.vault.adapter as FileSystemAdapter).basePath +
-        `/.obsidian/plugins/${this.plugin.manifest.id}`;
-      const installed = isRuntimeInstalled(pluginDir);
-
-      containerEl.createEl("p", {
-        cls: "setting-item-description",
-        text: installed
-          ? this.plugin.localEngine.ready
-            ? "✅ Runtime installed — engine loaded and ready."
-            : "✅ Runtime installed — engine idle (loads automatically on first OCR run)."
-          : "⚠️ Runtime not installed. Click \"Setup\" to download (~40 MB).",
-      });
-
-      if (!installed) {
-        new Setting(containerEl)
-          .setName("Setup local runtime")
-          .setDesc("Downloads onnxruntime-node native binaries for your platform.")
-          .addButton((btn) =>
-            btn
-              .setButtonText("Setup")
-              .setCta()
-              .onClick(async () => {
-                btn.setButtonText("Downloading…").setDisabled(true);
-                try {
-                  await installRuntime(pluginDir, this.plugin.manifest.version, (p: DownloadProgress) => {
-                    btn.setButtonText(p.message.slice(0, 30) + "…");
-                  });
-                  // Prime the module path so subsequent require() finds it
-                  prependPluginModulePath(pluginDir);
-                  new Notice("Local OCR runtime installed!", 8000);
-                  this.display(); // re-render panel to show installed state
-                } catch (err) {
-                  new Notice(`Setup failed: ${(err as Error).message}`, 8000);
-                  console.error("[text-lens] Runtime setup failed:", err);
-                  btn.setButtonText("Setup").setDisabled(false);
-                }
-              })
-          );
-      }
-
-      new Setting(containerEl)
-        .setName("Model tier")
-        .setDesc(
-          "tiny (~5 MB, fastest), small (~25 MB, balanced, default), medium (~60 MB, most accurate). " +
-          "Models are cached at ~/.cache/ppu-paddle-ocr/ after first use."
-        )
-        .addDropdown((drop) =>
-          drop
-            .addOption("tiny",   "Tiny (fastest)")
-            .addOption("small",  "Small (balanced)")
-            .addOption("medium", "Medium (most accurate)")
-            .setValue(this.plugin.settings.localModelTier)
-            .onChange(async (value) => {
-              this.plugin.settings.localModelTier = value as ModelTier;
-              await this.plugin.saveSettings();
-              // Destroy existing engine so it re-initialises with the new model
-              try {
-                await this.plugin.resetLocalEngine();
-              } catch (err) {
-                console.error("[text-lens] Failed to reset local engine after model tier change:", err);
-                new Notice(`切换模型失败: ${(err as Error).message}`, 6000);
-              }
-            })
-        );
-
-      if (installed && this.plugin.localEngine.ready) {
-        new Setting(containerEl)
-          .setName("Unload local engine")
-          .setDesc("Free the ~200 MB of ONNX inference session memory.")
-          .addButton((btn) =>
-            btn.setButtonText("Unload").onClick(async () => {
-              try {
-                await this.plugin.resetLocalEngine();
-                new Notice("Local OCR engine unloaded.", 3000);
-              } catch (err) {
-                console.error("[text-lens] Failed to unload local engine:", err);
-                new Notice(`卸载引擎失败: ${(err as Error).message}`, 6000);
-              }
-              this.display();
-            })
-          );
-      } else if (installed && !this.plugin.localEngine.ready) {
-        new Setting(containerEl)
-          .setName("Load local engine")
-          .setDesc("Pre-load the ONNX session into memory (also happens automatically on first OCR run).")
-          .addButton((btn) =>
-            btn
-              .setButtonText("Load")
-              .onClick(async () => {
-                btn.setButtonText("Loading…").setDisabled(true);
-                try {
-                  await this.plugin.localEngine.initialize();
-                  this.display();
-                } catch (err) {
-                  console.error("[text-lens] Failed to load local engine:", err);
-                  new Notice(`加载引擎失败: ${(err as Error).message}`, 6000);
-                  btn.setButtonText("Load").setDisabled(false);
-                }
-              })
-          );
-      }
-
-      // ── Cleanup ──────────────────────────────────────────────────────────────
-      if (installed) {
-        new Setting(containerEl)
-          .setName("Delete runtime files")
-          .setDesc(
-            "Remove onnxruntime-node, @napi-rs/canvas and ppu-bundle from the plugin directory (~40 MB). " +
-            "The engine will be unloaded first. You can re-install via \"Setup\"."
-          )
-          .addButton((btn) =>
-            btn.setButtonText("Delete").setWarning().onClick(() => {
-              new ConfirmModal(
-                this.plugin.app,
-                "Delete runtime files?",
-                "This will remove ~40 MB of native binaries from the plugin directory. " +
-                  "The local engine will be unloaded. You can re-install them at any time via \"Setup\".",
-                "Delete",
-                async () => {
-                  try {
-                    await this.plugin.localEngine?.destroy();
-                    await uninstallRuntime(pluginDir);
-                    new Notice("Runtime files deleted.", 4000);
-                  } catch (err) {
-                    new Notice(`删除失败: ${(err as Error).message}`, 6000);
-                    console.error("[text-lens] Failed to uninstall runtime:", err);
-                  }
-                  this.display();
-                }
-              ).open();
-            })
-          );
-      }
-
-      new Setting(containerEl)
-        .setName("Clear model cache")
-        .setDesc(
-          "Delete downloaded model weights from ~/.cache/ppu-paddle-ocr/ (5–60 MB depending on tier). " +
-          "Models will be re-downloaded automatically on next OCR run."
-        )
-        .addButton((btn) =>
-          btn.setButtonText("Clear").setWarning().onClick(() => {
-            new ConfirmModal(
-              this.plugin.app,
-              "Clear model cache?",
-              "This will delete cached model weights from ~/.cache/ppu-paddle-ocr/. " +
-                "They will be re-downloaded automatically when you next run OCR.",
-              "Clear",
-              async () => {
-                try {
-                  const { deleted, cachePath } = await clearModelCache();
-                  new Notice(
-                    deleted
-                      ? `Model cache cleared: ${cachePath}`
-                      : "No model cache found.",
-                    4000
-                  );
-                } catch (err) {
-                  new Notice(`清除失败: ${(err as Error).message}`, 6000);
-                  console.error("[text-lens] Failed to clear model cache:", err);
-                }
-              }
-            ).open();
-          })
-        );
-
-    // ── Output ────────────────────────────────────────────────────────────────
-    new Setting(containerEl).setName("Output").setHeading();
-
-    new Setting(containerEl)
-      .setName("Output format")
-      .setDesc("How to insert recognized text below each image.")
-      .addDropdown((drop) =>
-        drop
-          .addOption("callout", "Obsidian callout  (> [!note]+ OCR: …)")
-          .addOption("codeblock", "Fenced code block  (```ocr)")
-          .setValue(this.plugin.settings.outputFormat)
-          .onChange(async (value) => {
-            this.plugin.settings.outputFormat = value as "callout" | "codeblock";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Skip already-processed images")
-      .setDesc("Don't re-run OCR on images that already have an OCR block below them.")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.skipAlreadyProcessed).onChange(async (value) => {
-          this.plugin.settings.skipAlreadyProcessed = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Merge wrapped lines")
-      .setDesc(
-        "Automatically join OCR lines that are visual soft-wraps " +
-        "(e.g. a paragraph split across image rows). " +
-        "Lines ending with sentence punctuation (。！？ etc.) and list items " +
-        "are always kept separate."
+    const bufferSettled = await Promise.allSettled(
+      images.map((img) =>
+        img.isUrl
+          ? Promise.reject(new Error("URL images are not supported in local-only mode"))
+          : fileToArrayBuffer(app, img.src, activeFile)
       )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.useTextRefinement).onChange(async (value) => {
-          this.plugin.settings.useTextRefinement = value;
-          await this.plugin.saveSettings();
-        })
-      );
+    );
+    if (plugin.unloaded) return;
 
-    new Setting(containerEl)
-      .setName("Max concurrency")
-      .setDesc("Maximum number of images the OCR model processes in parallel during batch inference (1–20).")
-      .addText((text) =>
-        text
-          .setPlaceholder("3")
-          .setValue(String(this.plugin.settings.maxConcurrency))
-          .onChange(async (raw) => {
-            const n = parseInt(raw, 10);
-            if (!Number.isFinite(n)) return;
-            this.plugin.settings.maxConcurrency = Math.min(20, Math.max(1, n));
-            await this.plugin.saveSettings();
-          })
-      );
+    // Determine which images need to go through the model.
+    // Build a dense toProcess array and a globalIndex → localIndex map so Phase 3
+    // can look up results without an O(n) search.
+    const toProcess: number[] = [];
+    const globalToLocal = new Map<number, number>();
+    for (let i = 0; i < images.length; i++) {
+      const insertPos = images[i].index + images[i].fullMatch.length;
+      if (!isRerun && plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(content, insertPos)) {
+        continue; // will be recorded as skipped in Phase 3
+      }
+      if (bufferSettled[i].status === "rejected") {
+        continue; // I/O failure; will be recorded as error in Phase 3
+      }
+      globalToLocal.set(i, toProcess.length);
+      toProcess.push(i);
+    }
 
-    // ── Diagnostics ───────────────────────────────────────────────────────────
-    new Setting(containerEl).setName("Diagnostics").setHeading();
+    // ── Phase 2: True batch model inference ────────────────────────────────────
 
-    new Setting(containerEl)
-      .setName("Developer mode")
-      .setDesc("Log each image's raw OCR result to the browser console (Ctrl+Shift+I).")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.devMode).onChange(async (value) => {
-          this.plugin.settings.devMode = value;
-          await this.plugin.saveSettings();
-        })
+    // Each engine preserves input order and reports progress through this interface.
+    let batchResults: OcrItemResult[] = [];
+
+    if (toProcess.length > 0) {
+      const batchBuffers = toProcess.map(
+        (i) => (bufferSettled[i] as PromiseFulfilledResult<ArrayBuffer>).value
       );
-  }
+      batchResults = await plugin.engine.batchRecognize(
+        batchBuffers,
+        plugin.settings.maxConcurrency,
+        (batchDone, batchTotal) => {
+          notice.setMessage(
+            `${label}: ${batchDone} / ${batchTotal ?? toProcess.length} done…`
+          );
+        }
+      );
+    }
+
+    // ── Phase 3: Map batch results back to per-image OcrTaskResult[] ────────────
+
+    const results: OcrTaskResult[] = images.map((img, i) => {
+      const insertPos = img.index + img.fullMatch.length;
+
+      // Already-processed skip
+      if (!isRerun && plugin.settings.skipAlreadyProcessed && isAlreadyProcessed(content, insertPos)) {
+        return { img, texts: null, skipped: true, error: null };
+      }
+
+      // I/O failure (buffer read failed)
+      const bufResult = bufferSettled[i];
+      if (bufResult.status === "rejected") {
+        const err =
+          bufResult.reason instanceof Error
+            ? bufResult.reason
+            : new Error(String(bufResult.reason));
+        console.error(`[text-lens] I/O failed for "${img.src}":`, err);
+        return { img, texts: null, skipped: false, error: err };
+      }
+
+      // Look up this image's batch result
+      const localIdx = globalToLocal.get(i)!;
+      const batchItem = batchResults[localIdx];
+
+      if (!batchItem || batchItem.status === "rejected") {
+        const reason =
+          batchItem?.status === "rejected" ? batchItem.reason : new Error("No batch result");
+        const err = reason instanceof Error ? reason : new Error(String(reason));
+        console.error(`[text-lens] OCR failed for "${img.src}":`, err);
+        return { img, texts: null, skipped: false, error: err };
+      }
+
+      const rawTexts = batchItem.value;
+
+      if (plugin.settings.devMode) {
+        console.log(`[text-lens] ${img.src.split("/").pop()} raw:`, batchItem.rawLines ?? rawTexts);
+      }
+
+      if (rawTexts.length === 0) {
+        return { img, texts: null, skipped: false, error: new Error("OCR returned no text") };
+      }
+
+      const texts = plugin.settings.useTextRefinement
+        ? refineLineBreaks(rawTexts)
+        : rawTexts;
+
+      if (plugin.settings.devMode && plugin.settings.useTextRefinement) {
+        console.log(`[text-lens] ${img.src.split("/").pop()} refined:`, texts);
+      }
+
+      return { img, texts, skipped: false, error: null };
+    });
+
+    // ── Write results back into the document ───────────────────────────────────
+
+    let workingContent = content;
+    for (const { img, texts } of [...results].sort((a, b) => b.img.index - a.img.index)) {
+      if (!texts) continue;
+      const insertPos = img.index + img.fullMatch.length;
+      if (isRerun) workingContent = removeOcrBlock(workingContent, insertPos);
+      const insertion = formatOcrText(texts, plugin.settings.outputFormat, img.src);
+      workingContent =
+        workingContent.slice(0, insertPos) + insertion + workingContent.slice(insertPos);
+    }
+
+    if (plugin.unloaded) return;
+    if (editor.getValue() !== content || app.workspace.getActiveViewOfType(MarkdownView)?.file !== activeFile) {
+      new Notice("OCR finished, but the note changed or was closed. Run OCR again to insert results safely.", 8000);
+      return;
+    }
+    // A single editor transaction creates one undo entry.
+    if (workingContent !== content) editor.transaction({ changes: [{ from: { line: 0, ch: 0 }, to: editor.offsetToPos(content.length), text: workingContent }] });
+
+    const resized = batchResults.flatMap((item) => item.status === "fulfilled" && item.resized ? [images[toProcess[item.index]].src] : []);
+    if (resized.length) new Notice(`OCR scaled oversized images to the system limit:\n${resized.join("\n")}`, 10000);
+
+    notice.hide();
+    const errors = results.filter((r) => r.error).length;
+    if (errors > 0) {
+      new Notice(
+        `OCR complete: ${results.length - errors} succeeded, ${errors} failed. Check console for details.`,
+        6000
+      );
+    } else {
+      new Notice(`OCR complete: ${results.length} image(s) processed.`, 4000);
+    }
+  } finally { notice.hide(); }
 }
 
-// ── Plugin class ──────────────────────────────────────────────────────────────
+// Plugin lifecycle and command dispatch
 
 export default class OcrImagePlugin extends Plugin {
   settings!: OcrImageSettings;
-  localEngine!: LocalOcrEngine;
+  engine!: OcrEngine;
+  busy = false;
+  unloaded = false;
+  readonly lifetime = new AbortController();
+  private settingTab!: OcrImageSettingTab;
 
   async onload() {
     await this.loadSettings();
-
-    // Determine plugin directory (needed for runtime binary resolution)
-    const pluginDir = this.getPluginDir();
-
-    // Register plugin's node_modules into Node.js module search path so that
-    // `require('onnxruntime-node')` inside ppu-paddle-ocr finds our local copy.
-    prependPluginModulePath(pluginDir);
-
-    // Create local engine (not yet initialised — lazy on first use)
-    this.localEngine = new LocalOcrEngine({
-      modelTier: this.settings.localModelTier,
-      pluginDir,
-      verbose: this.settings.devMode,
-    });
-
-    // If runtime is already installed, warm up the engine in the background
-    // so the first OCR call is fast.
-    if (isRuntimeInstalled(pluginDir)) {
-      this.localEngine.initialize().catch((err) => {
-        console.error("[text-lens] Background engine init failed:", err);
-      });
+    prependPluginModulePath(this.getPluginDir());
+    this.engine = this.createEngine();
+    if (this.settings.ocrSource === "paddle" && isRuntimeInstalled(this.getPluginDir())) {
+      void this.engine.initialize().catch((error) => console.error("[text-lens] Background engine init failed:", error));
     }
-
-    this.addSettingTab(new OcrImageSettingTab(this.app, this));
-
+    this.settingTab = new OcrImageSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
     this.addCommand({
       id: "ocr-current-note",
       name: "OCR Current Note",
       editorCallback: async (editor: Editor, view: MarkdownView) => {
         const activeFile = view.file;
-        if (!activeFile) {
-          new Notice("TextLens: no active file.");
-          return;
-        }
-
-        // If the engine is not yet initialised, do it now with a user-visible notice.
-        if (!this.localEngine.ready) {
-          if (!isRuntimeInstalled(pluginDir)) {
-            // Runtime binaries are absent — tell the user and abort.  Without
-            // this guard the engine stays uninitialised but batchRecognize() would still
-            // be called, throwing a cryptic internal error.
-            new Notice(
-              "Local OCR runtime is not installed.\n" +
-              "Open Settings → TextLens → Local OCR Engine and click \"Setup\".",
-              8000
-            );
+        if (!activeFile) { new Notice("TextLens: no active file."); return; }
+        if (!this.beginWork()) return;
+        let initNotice: Notice | undefined;
+        try {
+          if (this.settings.ocrSource === "paddle" && !isRuntimeInstalled(this.getPluginDir())) {
+            new Notice('PaddleOCR runtime is not installed. Open Settings ? TextLens and click "Setup".', 8000);
             return;
           }
-
-          const initNotice = new Notice("OCR: loading local engine…", 0);
-          let initOk = false;
-          try {
-            await this.localEngine.initialize();
-            initOk = true;
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            new Notice(`Local OCR engine failed to load:\n${msg}`, 10000);
-            console.error("[text-lens] Engine init failed:", err);
-          } finally {
+          if (!this.engine.ready) {
+            initNotice = new Notice("OCR: loading selected engine?", 0);
+            await this.engine.initialize();
             initNotice.hide();
           }
-          if (!initOk) return;
-        }
-
-        try {
-          await processNote(this.app, this, editor, activeFile);
-        } catch (err) {
-          console.error("[text-lens] Unexpected error in processNote:", err);
-          new Notice(
-            `OCR failed unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
-            8000
-          );
+          if (!this.unloaded) await processNote(this.app, this, editor, activeFile);
+        } catch (error) {
+          console.error("[text-lens] OCR failed:", error);
+          if (!this.unloaded) new Notice("OCR failed: " + (error instanceof Error ? error.message : String(error)), 10000);
+        } finally {
+          initNotice?.hide();
+          this.endWork();
         }
       },
     });
   }
 
+  beginWork(): boolean {
+    if (this.unloaded) return false;
+    if (this.busy) { new Notice("TextLens is already working. Wait for the current operation to finish."); return false; }
+    this.busy = true;
+    this.settingTab?.display();
+    return true;
+  }
+
+  endWork(): void {
+    this.busy = false;
+    if (!this.unloaded) this.settingTab?.display();
+  }
+
   onunload() {
-    void this.localEngine?.destroy().catch((err: unknown) => {
-      console.error("[text-lens] Error during engine cleanup on unload:", err);
-    });
+    this.unloaded = true;
+    this.lifetime.abort();
+    void this.engine?.destroy().catch((error: unknown) => console.error("[text-lens] Engine cleanup failed:", error));
   }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<OcrImageSettings>);
+    if (this.settings.ocrSource !== "native") this.settings.ocrSource = "paddle";
+    if (typeof this.settings.nativeLanguage !== "string" || !this.settings.nativeLanguage) this.settings.nativeLanguage = "auto";
   }
 
-  async saveSettings() {
-    await this.saveData(this.settings);
+  async saveSettings() { await this.saveData(this.settings); }
+
+  private createEngine(): OcrEngine {
+    const pluginDir = this.getPluginDir();
+    return this.settings.ocrSource === "native"
+      ? new NativeOcrEngine({ pluginDir, version: this.manifest.version, language: this.settings.nativeLanguage, verbose: this.settings.devMode })
+      : new LocalOcrEngine({ pluginDir, modelTier: this.settings.localModelTier, verbose: this.settings.devMode });
   }
 
-  /** Destroy and recreate the local engine (e.g. after model tier change). */
-  async resetLocalEngine() {
-    await this.localEngine?.destroy();
-    this.localEngine = new LocalOcrEngine({
-      modelTier: this.settings.localModelTier,
-      pluginDir: this.getPluginDir(),
-      verbose: this.settings.devMode,
-    });
+  async resetEngine(): Promise<void> {
+    await this.engine?.destroy();
+    if (!this.unloaded) this.engine = this.createEngine();
   }
 
   getPluginDir(): string {
-    return (this.app.vault.adapter as FileSystemAdapter).basePath +
-      `/.obsidian/plugins/${this.manifest.id}`;
+    const adapter = this.app.vault.adapter;
+    if (!(adapter instanceof FileSystemAdapter)) throw new Error("TextLens requires a desktop filesystem vault");
+    return path.join(adapter.getBasePath(), this.app.vault.configDir, "plugins", this.manifest.id);
   }
 }

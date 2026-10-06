@@ -2,3 +2,4 @@ node_modules/
 main.js
 ppu-bundle.cjs
 *.js.map
+build/
