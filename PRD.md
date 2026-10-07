@@ -1,11 +1,11 @@
 # PRD — TextLens Obsidian Plugin
 
-**文档版本**：1.7
+**文档版本**：1.8
 
-**日期**：2026-10-06
+**日期**：2026-10-07
 
 **作者**：wangrunyu  
-**状态**：PaddleOCR 基线 v1.3.8；系统原生 OCR 已实现，平台验收待完成，尚未标记为正式可用
+**状态**：v1.4.0；PaddleOCR 默认，系统原生 OCR 为实验性功能，完整平台验收待完成
 
 ---
 
@@ -315,10 +315,10 @@ Developer mode             [○]
 | v1.3.5 | 回滚图片读取：恢复 `window.fetch(app://)` 以支持 macOS 隔离文件（`vault.readBinary` 底层 `fs.readFile` 在隔离文件上报 EPERM） |
 | v1.3.6 | 兼容性回滚：`setDestructive()` → `setWarning()`、`minAppVersion` 恢复 1.7.2，确保对旧版 Obsidian 的支持 |
 | v1.3.7 | 补全剩余 `setWarning()` 替换；所有 Obsidian 官方 Review 问题清零 |
-| **v1.3.8**（当前） | 改造为真正 Batch Inference：新增 `LocalOcrEngine.batchRecognize()`，调用 ppu-paddle-ocr 原生 `batchRecognize()` 实现模型层批量推理；`processNote()` 重构为三阶段流水线（I/O 全并行 → 模型层 batch → 结果映射写回）；删除手写并发池 `withConcurrency()` 和 `runOcr()` |
-| 系统原生 OCR（开发中） | Windows.Media.Ocr 和 Apple Vision、公共接口、来源／语言设置、helper 安装校验、期限／取消和临时清理；完成对应平台验收后再标记为可用 |
-| v1.4（计划） | 右键菜单「OCR This Image」单张触发 |
-| v1.5（计划） | 自动 OCR：新图片粘贴入笔记时自动触发 |
+| v1.3.8 | 改造为真正 Batch Inference：新增 `LocalOcrEngine.batchRecognize()`，调用 ppu-paddle-ocr 原生 `batchRecognize()` 实现模型层批量推理；`processNote()` 重构为三阶段流水线（I/O 全并行 → 模型层 batch → 结果映射写回）；删除手写并发池 `withConcurrency()` 和 `runOcr()` |
+| **v1.4.0**（当前） | 实验性 Windows.Media.Ocr 和 Apple Vision、公共接口、来源／语言设置、helper 安装校验、期限／取消和临时清理；完成对应平台验收后再标记为正式可用 |
+| 后续版本（计划） | 右键菜单「OCR This Image」单张触发 |
+| 后续版本（计划） | 自动 OCR：新图片粘贴入笔记时自动触发 |
 
 ---
 

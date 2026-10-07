@@ -1,7 +1,7 @@
 {
   "id": "text-lens",
   "name": "TextLens",
-  "version": "1.3.8",
+  "version": "1.4.0",
   "minAppVersion": "1.7.2",
   "description": "Extract image text inline with on-device PaddleOCR or experimental system native OCR on Windows/macOS. No server or API key.",
   "author": "wangrunyu",

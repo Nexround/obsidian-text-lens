@@ -1,6 +1,6 @@
 # TextLens — Obsidian Plugin
 
-An [Obsidian](https://obsidian.md) plugin that scans the active note for image references and inserts recognized text below each image. **PaddleOCR remains the default.** This development version also offers experimental system OCR through Windows.Media.Ocr and macOS Apple Vision. Recognition runs on your device, without a server or API key.
+An [Obsidian](https://obsidian.md) plugin that scans the active note for image references and inserts recognized text below each image. **PaddleOCR remains the default.** Version 1.4.0 also offers experimental system OCR through Windows.Media.Ocr and macOS Apple Vision. Recognition runs on your device, without a server or API key.
 
 ## Features
 

@@ -1,6 +1,6 @@
 {
   "name": "text-lens",
-  "version": "1.3.8",
+  "version": "1.4.0",
   "description": "Obsidian plugin: on-device image OCR via PaddleOCR or experimental Windows/macOS native OCR",
   "main": "main.js",
   "scripts": {
