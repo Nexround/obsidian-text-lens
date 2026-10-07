@@ -344,7 +344,7 @@ Developer mode             [○]
 | TypeScript `npm run typecheck`、生产构建 | 本地通过；第三方声明文件使用 `skipLibCheck`，插件源代码仍检查 |
 | `npm test` | 正式传输层的顺序、单图错误、崩溃、期限、损坏协议／索引、格式回退、取消和清理通过；命令测试覆盖默认值合并、无 Paddle 运行时调用、设置锁定、重复执行、重跑保留失败图旧结果、一次事务、编辑保护和卸载取消 |
 | `npm run probe:windows` | 正式桥接实际识别通过：英文、中文、中英混排、中文路径、默认语言、空白图、损坏图、超尺寸缩小、缺失语言；缺失语言根据实际已安装能力选择 |
-| macOS arm64/x64 | 当前 Windows 机器无法编译或执行 Vision，尚未实测；发布 CI 为两种架构构建、签名、跑真实识别和安装 probe |
+| macOS arm64/x64 | [发布前 CI](https://github.com/Nexround/obsidian-text-lens/actions/runs/37587264266) 在 macOS 15 上完成两个架构的编译、ad-hoc 签名、真实 Vision 识别、安装校验和离线复用；最低目标系统的实机测试仍待完成 |
 | 无开发工具 Mac | 待进行：`npm run probe:macos -- --release` 检查对应版本 Release 下载、安装、执行和离线复用，probe 使用预置图片，无需 Swift |
 | 两端 Obsidian 验收 | 待进行：首次初始化、批量进度、来源／语言锁定及切换、重新识别、失败图旧结果保留、单步撤销、卸载取消、原生模式无 PaddleOCR 运行时 |
 

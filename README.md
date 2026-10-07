@@ -74,7 +74,7 @@ Native OCR remains experimental until its platform acceptance is complete:
 | Platform | Verification Status |
 |----------|---------------------|
 | Windows | The shipped bridge passed real subprocess recognition for English, Chinese, mixed text, Unicode paths, system default, blank/corrupt images, scaling and missing languages. Obsidian acceptance remains pending. |
-| macOS arm64/x64 | Swift source, installer, build and real Vision probes are implemented. Compilation and execution have not been verified on the current Windows development machine. Release CI runs both architectures; testing on Macs without developer tools and Obsidian acceptance remain pending. |
+| macOS arm64/x64 | Both architectures passed helper compilation, ad-hoc signing, real Vision recognition, verified installation and offline reuse in [release preflight CI](https://github.com/Nexround/obsidian-text-lens/actions/runs/37587264266) on macOS 15. Minimum-version Mac testing, Release download testing on Macs without developer tools and Obsidian acceptance remain pending. |
 
 ### Callout output (default)
 
